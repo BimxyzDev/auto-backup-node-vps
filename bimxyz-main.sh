@@ -396,6 +396,20 @@ do_backup() {
     remote_target=$(get_remote_target)
     log STEP "Remote target: $remote_target"
 
+    # Stop Wings sebelum backup agar CPU tidak overload
+    local wings_was_running=false
+    if systemctl is-active --quiet wings 2>/dev/null; then
+        log STEP "Menghentikan Wings sementara untuk backup..."
+        if systemctl stop wings 2>/dev/null; then
+            wings_was_running=true
+            log INFO "Wings dihentikan ✓"
+        else
+            log WARN "Gagal menghentikan Wings — backup tetap dilanjutkan"
+        fi
+    else
+        log INFO "Wings tidak aktif — lanjut backup"
+    fi
+
     # Compress — [FIX #4] Smart compression dengan nice + pigz jika ada
     local t0=$SECONDS
     smart_compress "/var/lib/pterodactyl" "volumes" "$tmpf"
@@ -410,6 +424,21 @@ do_backup() {
         || { log ERROR "Upload gagal!"; exit 1; }
 
     rm -f "$tmpf"
+
+    # Restart Wings jika sebelumnya aktif
+    if $wings_was_running; then
+        log STEP "Menghidupkan kembali Wings..."
+        if systemctl start wings 2>/dev/null; then
+            sleep 3
+            if systemctl is-active --quiet wings 2>/dev/null; then
+                log INFO "Wings RUNNING kembali ✓"
+            else
+                log WARN "Wings gagal start — cek: systemctl status wings"
+            fi
+        else
+            log WARN "Gagal menjalankan Wings — jalankan manual: systemctl start wings"
+        fi
+    fi
 
     # Retention cleanup — [FIX #2] || true sudah ada, tapi pastikan eksplisit
     log STEP "Hapus backup >${RETENTION_DAYS} hari..."
