@@ -422,9 +422,10 @@ show_status() {
         echo -e "  Auto-Backup: ${YELLOW}${BOLD}TIDAK AKTIF${NC}"
     fi
 
-    local last; last=$(grep "BACKUP COMPLETE\|RESTORE COMPLETE" "$LOG_FILE" 2>/dev/null | tail -1 || echo "")
-    [ -n "$last" ] && echo -e "  Last Op    : ${BOLD}$(echo "$last" | cut -d' ' -f1-3)${NC} — $(echo "$last" | cut -d']' -f3-)"
+        local last; last=$(grep "BACKUP COMPLETE\|RESTORE COMPLETE" "$LOG_FILE" 2>/dev/null | tail -1 || echo "")
+    [ -n "$last" ] && echo -e "  Last Op    : ${BOLD}$(echo "$last" | cut -d' ' -f1-3)${NC} — $(echo "$last" | cut -d']' -f3-)" || true
 }
+
 
 # ─── BANNER ──────────────────────────────────────────────
 show_banner() {
