@@ -25,7 +25,7 @@ fi
 echo -e "${YELLOW}[*] Mengunduh komponen utama sistem Bimxyz...${NC}"
 
 # ⚠️ GANTI LINK INI DENGAN LINK RAW GITHUB FILE "bimxyz-main.sh" ANDA:
-MAIN_SCRIPT_URL="https://raw.githubusercontent.com/username-lu/repo-lu/main/bimxyz-main.sh"
+MAIN_SCRIPT_URL="https://raw.githubusercontent.com/BimxyzDev/auto-backup-node-vps/refs/heads/main/bimxyz-main.sh"
 
 # Proses Unduh dan Instalasi ke Direktori Sistem
 curl -sL "$MAIN_SCRIPT_URL" -o /usr/local/bin/bimxyz
