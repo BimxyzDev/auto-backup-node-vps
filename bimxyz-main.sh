@@ -2,16 +2,11 @@
 # ╔═══════════════════════════════════════════════════════════╗
 # ║     BIMXYZ ULTIMATE BACKUP SYSTEM V4.1                   ║
 # ║     Production Grade | Multi-Server | Auto-Retry         ║
-# ║     Optimized: Folder-ID Detection, Safe Pipefail,       ║
-# ║                Smart Compression, Auto-Repair Config      ║
 # ╚═══════════════════════════════════════════════════════════╝
 
-# [FIX #2] — Jangan gunakan set -e mentah. Gunakan -uo pipefail saja.
-# Error handling per-perintah kritis lebih aman daripada set -e global
-# yang bisa membunuh script hanya karena grep tidak menemukan hasil.
 set -uo pipefail
 
-# ─── CONSTANTS ───────────────────────────────────────────────
+# ─── KONSTANTA ───────────────────────────────────────────────
 readonly VERSION="4.1"
 readonly REMOTE_NAME="gdrive_bimxyz"
 readonly GDRIVE_FOLDER="Backup_Bimxyz"
@@ -19,7 +14,7 @@ readonly PTERO_PATH="/var/lib/pterodactyl/volumes"
 readonly CONFIG_DIR="/root/.bimxyz"
 readonly TEMP_DIR="/root/.bimxyz_temp"
 readonly NODE_CONFIG="$CONFIG_DIR/node.conf"
-readonly FOLDER_ID_CACHE="$CONFIG_DIR/gdrive_folder_id.cache"  # [FIX #1] Cache Folder ID
+readonly FOLDER_ID_CACHE="$CONFIG_DIR/gdrive_folder_id.cache"
 readonly LOG_FILE="/var/log/bimxyz_backup.log"
 readonly MAX_RETRIES=3
 readonly RETENTION_DAYS=7
@@ -42,23 +37,23 @@ log() {
     esac
 }
 
-# ─── CLEANUP ─────────────────────────────────────────────────
+# ─── PEMBERSIHAN ─────────────────────────────────────────────
 cleanup() {
     local code=$?
     [ -d "$TEMP_DIR" ] && rm -rf "$TEMP_DIR"
-    [ $code -ne 0 ] && log ERROR "Terminated (exit $code) — cek: $LOG_FILE"
+    [ $code -ne 0 ] && log ERROR "Proses dihentikan (kode: $code) — periksa log: $LOG_FILE"
 }
 trap cleanup EXIT
-trap 'log ERROR "Interrupted!"; exit 130' INT TERM
+trap 'log ERROR "Proses dibatalkan oleh pengguna."; exit 130' INT TERM
 
-# ─── ROOT CHECK ──────────────────────────────────────────────
+# ─── PEMERIKSAAN HAK AKSES ROOT ──────────────────────────────
 check_root() {
     [ "$EUID" -eq 0 ] && return
-    echo -e "${RED}[✗] Harus root. Jalankan: sudo bash $0${NC}"
+    echo -e "${RED}[✗] Skrip ini harus dijalankan sebagai root. Gunakan: sudo bash $0${NC}"
     exit 1
 }
 
-# ─── DEPENDENCIES ────────────────────────────────────────────
+# ─── INSTALASI DEPENDENSI ────────────────────────────────────
 install_deps() {
     local missing=()
     command -v rclone  &>/dev/null || missing+=("rclone")
@@ -68,38 +63,33 @@ install_deps() {
 
     [ ${#missing[@]} -eq 0 ] && return 0
 
-    log STEP "Installing: ${missing[*]}"
+    log STEP "Menginstal dependensi: ${missing[*]}"
     for dep in "${missing[@]}"; do
         if [ "$dep" == "rclone" ]; then
             curl -fsSL https://rclone.org/install.sh | bash >/dev/null 2>&1 \
-                || { log ERROR "Gagal install rclone"; exit 1; }
+                || { log ERROR "Gagal menginstal rclone."; exit 1; }
         else
             DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$dep" >/dev/null 2>&1 \
-                || { log ERROR "Gagal install $dep"; exit 1; }
+                || { log ERROR "Gagal menginstal $dep."; exit 1; }
         fi
     done
-    log INFO "Semua dependency OK"
+    log INFO "Semua dependensi berhasil diinstal."
 }
 
-# ─── AUTO-REPAIR CONFIG [FIX #5] ─────────────────────────────
-# Jika rclone.conf hilang/tidak ada remote, tapi service_account.json
-# masih ada di CONFIG_DIR, lakukan auto-config ulang secara silent.
+# ─── PERBAIKAN OTOMATIS KONFIGURASI RCLONE ───────────────────
 auto_repair_rclone_config() {
     local sa_file="$CONFIG_DIR/service_account.json"
 
-    # Sudah ada remote yang valid — tidak perlu repair
     if rclone listremotes 2>/dev/null | grep -q "^${REMOTE_NAME}:$"; then
         return 0
     fi
 
-    # Tidak ada SA file — tidak bisa auto-repair
     [ -f "$sa_file" ] || return 1
 
-    log WARN "Remote '$REMOTE_NAME' hilang dari rclone.conf — mencoba auto-repair..."
+    log WARN "Remote '$REMOTE_NAME' tidak ditemukan di konfigurasi rclone — mencoba perbaikan otomatis..."
 
-    # Validasi JSON dulu sebelum dipakai
     if ! python3 -c "import json,sys; json.load(open('$sa_file'))" 2>/dev/null; then
-        log ERROR "service_account.json tidak valid — auto-repair dibatalkan"
+        log ERROR "File service_account.json tidak valid — perbaikan otomatis dibatalkan."
         return 1
     fi
 
@@ -107,21 +97,16 @@ auto_repair_rclone_config() {
         service_account_file="$sa_file" \
         scope=drive \
         --non-interactive >/dev/null 2>&1 || {
-        log ERROR "Auto-repair gagal membuat remote"
+        log ERROR "Perbaikan otomatis gagal membuat remote."
         return 1
     }
 
-    log INFO "Auto-repair rclone config berhasil (dari service_account.json)"
+    log INFO "Perbaikan otomatis konfigurasi rclone berhasil."
     return 0
 }
 
-# ─── RESOLVE GDRIVE FOLDER ID [FIX #1] ───────────────────────
-# Masalah utama Exit 3: rclone lsd hanya mencari di Root Drive.
-# Folder yang di-share via "Shared with me" tidak akan terdeteksi.
-# Solusi: Gunakan rclone backend 'find' untuk mencari Folder ID,
-# kemudian cache ID-nya agar tidak perlu query ulang setiap run.
+# ─── PENCARIAN FOLDER ID GOOGLE DRIVE ────────────────────────
 resolve_gdrive_folder_id() {
-    # Gunakan cache jika masih valid (< 24 jam)
     if [ -f "$FOLDER_ID_CACHE" ]; then
         local cache_age
         cache_age=$(( $(date +%s) - $(stat -c %Y "$FOLDER_ID_CACHE" 2>/dev/null || echo 0) ))
@@ -131,11 +116,11 @@ resolve_gdrive_folder_id() {
         fi
     fi
 
-    log STEP "Mencari Folder ID untuk '$GDRIVE_FOLDER' (Root + Shared with me)..."
+    log STEP "Mencari Folder ID untuk '$GDRIVE_FOLDER' (Drive Utama & Dibagikan ke Saya)..."
 
     local folder_id=""
 
-    # Metode 1: Cari di Root Drive dulu (paling cepat)
+    # Pencarian di Drive Utama
     folder_id=$(rclone lsjson "$REMOTE_NAME:" \
         --drive-trashed-only=false 2>/dev/null \
         | python3 -c "
@@ -147,9 +132,9 @@ for item in items:
         break
 " 2>/dev/null || echo "")
 
-    # Metode 2: Cari di 'Shared with me' jika tidak ditemukan di Root
+    # Pencarian di folder "Dibagikan ke Saya"
     if [ -z "$folder_id" ]; then
-        log STEP "Tidak ada di Root — mencari di 'Shared with me'..."
+        log STEP "Folder tidak ditemukan di Drive Utama — mencari di folder 'Dibagikan ke Saya'..."
         folder_id=$(rclone lsjson "$REMOTE_NAME:" \
             --drive-shared-with-me \
             --drive-trashed-only=false 2>/dev/null \
@@ -164,13 +149,12 @@ for item in items:
     fi
 
     if [ -z "$folder_id" ]; then
-        # Metode 3 (fallback): Buat folder baru di Root Drive
-        log WARN "Folder '$GDRIVE_FOLDER' tidak ditemukan — membuat folder baru di Root..."
+        # Buat folder baru jika tidak ditemukan di mana pun
+        log WARN "Folder '$GDRIVE_FOLDER' tidak ditemukan — membuat folder baru di Drive Utama..."
         rclone mkdir "$REMOTE_NAME:$GDRIVE_FOLDER" 2>/dev/null || {
-            log ERROR "Gagal membuat folder '$GDRIVE_FOLDER' di GDrive"
+            log ERROR "Gagal membuat folder '$GDRIVE_FOLDER' di Google Drive."
             return 1
         }
-        # Query lagi setelah dibuat
         folder_id=$(rclone lsjson "$REMOTE_NAME:" \
             --drive-trashed-only=false 2>/dev/null \
             | python3 -c "
@@ -184,81 +168,71 @@ for item in items:
     fi
 
     if [ -z "$folder_id" ]; then
-        log ERROR "Gagal resolve Folder ID untuk '$GDRIVE_FOLDER'"
+        log ERROR "Gagal mendapatkan Folder ID untuk '$GDRIVE_FOLDER'."
         return 1
     fi
 
-    # Simpan ke cache
     echo "$folder_id" > "$FOLDER_ID_CACHE"
-    log INFO "Folder ID ditemukan: $folder_id (di-cache)"
+    log INFO "Folder ID ditemukan: $folder_id (disimpan ke cache)."
     echo "$folder_id"
 }
 
-# Helper: bangun remote path berdasarkan Folder ID jika tersedia
-# Menggunakan format --drive-root-folder-id agar tidak tergantung path string
+# Mendapatkan path remote berdasarkan Folder ID (jika tersedia)
 get_remote_target() {
     local folder_id
     folder_id=$(resolve_gdrive_folder_id 2>/dev/null || echo "")
     if [ -n "$folder_id" ]; then
-        # Pakai ID langsung — ini bypass masalah "Shared with me" sepenuhnya
         echo "$REMOTE_NAME:{$folder_id}"
     else
-        # Fallback ke path string biasa
         echo "$REMOTE_NAME:$GDRIVE_FOLDER"
     fi
 }
 
-# ─── GDRIVE SETUP ────────────────────────────────────────────
+# ─── KONEKSI GOOGLE DRIVE ─────────────────────────────────────
 gdrive_is_alive() {
-    # [FIX #2] Jangan biarkan ini membunuh script via set -e
-    # Setiap sub-perintah sudah di-handle dengan || false secara eksplisit
     rclone listremotes 2>/dev/null | grep -q "^${REMOTE_NAME}:$" || return 1
     rclone lsd "$REMOTE_NAME:" &>/dev/null || return 1
     return 0
 }
 
 setup_gdrive() {
-    # [FIX #5] Coba auto-repair dulu sebelum minta setup manual
     auto_repair_rclone_config || true
 
     if gdrive_is_alive; then
-        log INFO "GDrive terhubung ✓"
+        log INFO "Google Drive berhasil terhubung."
         return 0
     fi
 
-    # Hapus remote rusak
     rclone config delete "$REMOTE_NAME" 2>/dev/null || true
-    # Invalidasi cache Folder ID jika remote direset
     rm -f "$FOLDER_ID_CACHE"
 
-    echo -e "\n${CYAN}${BOLD}═══════ SETUP GOOGLE DRIVE ═══════${NC}"
-    echo -e "  ${BOLD}1.${NC} Service Account JSON ${GREEN}[RECOMMENDED - untuk deploy massal]${NC}"
-    echo -e "  ${BOLD}2.${NC} OAuth Token ${YELLOW}[untuk 1 server / testing]${NC}"
+    echo -e "\n${CYAN}${BOLD}═══════ PENGATURAN GOOGLE DRIVE ═══════${NC}"
+    echo -e "  ${BOLD}1.${NC} Service Account JSON ${GREEN}[Direkomendasikan — untuk banyak server]${NC}"
+    echo -e "  ${BOLD}2.${NC} OAuth Token ${YELLOW}[Untuk 1 server / keperluan pengujian]${NC}"
     echo ""
     read -rp "Pilihan (1/2): " AUTH
 
     case "$AUTH" in
         1) setup_service_account ;;
         2) setup_oauth ;;
-        *) log ERROR "Pilihan tidak valid"; exit 1 ;;
+        *) log ERROR "Pilihan tidak valid."; exit 1 ;;
     esac
 }
 
 setup_service_account() {
-    echo -e "\n${CYAN}PANDUAN SERVICE ACCOUNT:${NC}"
+    echo -e "\n${CYAN}PANDUAN PENGATURAN SERVICE ACCOUNT:${NC}"
     echo -e "  1. Buka ${YELLOW}https://console.cloud.google.com/${NC}"
-    echo -e "  2. IAM & Admin → Service Accounts → Create"
-    echo -e "  3. Keys → Add Key → JSON → Download"
-    echo -e "  4. Share folder GDrive ke email service account"
-    echo -e "\n${YELLOW}Paste isi file JSON (lalu CTRL+D):${NC}"
+    echo -e "  2. Navigasi ke IAM & Admin → Service Accounts → Create"
+    echo -e "  3. Pilih Keys → Add Key → JSON → Download"
+    echo -e "  4. Bagikan folder Google Drive ke alamat email service account tersebut"
+    echo -e "\n${YELLOW}Tempel isi file JSON di bawah ini, lalu tekan CTRL+D:${NC}"
 
     mkdir -p "$CONFIG_DIR"
     local sa_file="$CONFIG_DIR/service_account.json"
     cat > "$sa_file"
 
-    # Validasi JSON
     python3 -c "import json,sys; json.load(open('$sa_file'))" 2>/dev/null \
-        || { log ERROR "JSON tidak valid!"; rm -f "$sa_file"; exit 1; }
+        || { log ERROR "Format JSON tidak valid."; rm -f "$sa_file"; exit 1; }
     chmod 600 "$sa_file"
 
     rclone config create "$REMOTE_NAME" drive \
@@ -267,14 +241,15 @@ setup_service_account() {
         --non-interactive >/dev/null 2>&1
 
     gdrive_is_alive \
-        || { log ERROR "Koneksi gagal — cek permission service account"; exit 1; }
-    log INFO "Service Account berhasil dikonfigurasi"
+        || { log ERROR "Koneksi gagal — periksa izin akses service account."; exit 1; }
+    log INFO "Service Account berhasil dikonfigurasi."
 }
 
 setup_oauth() {
-    echo -e "\n${CYAN}Jalankan ini di PC yang ada browser-nya:${NC}"
+    echo -e "\n${CYAN}Jalankan perintah berikut di Termux, lalu masuk dengan akun Google Drive yang ingin digunakan:${NC}"
+    echo -e "  ${YELLOW}pkg update -y && pkg install rclone -y${NC}"
     echo -e "  ${YELLOW}rclone authorize \"drive\"${NC}"
-    echo -e "\nPaste token JSON di sini:"
+    echo -e "\nTempel token JSON yang dihasilkan di sini:"
     read -rp "> " TOKEN_JSON
 
     rclone config create "$REMOTE_NAME" drive \
@@ -283,38 +258,38 @@ setup_oauth() {
         --non-interactive >/dev/null 2>&1
 
     gdrive_is_alive \
-        || { log ERROR "Token tidak valid"; exit 1; }
-    log INFO "OAuth berhasil"
+        || { log ERROR "Token tidak valid atau koneksi gagal."; exit 1; }
+    log INFO "Autentikasi OAuth berhasil."
 }
 
-# ─── NODE NAME ───────────────────────────────────────────────
+# ─── NAMA NODE ───────────────────────────────────────────────
 get_node_name() {
     mkdir -p "$CONFIG_DIR"
     if [ ! -f "$NODE_CONFIG" ]; then
-        read -rp "Nama Node (contoh: SG-Node-01): " input
+        read -rp "Masukkan nama node (contoh: SG-Node-01): " input
         local sanitized
         sanitized=$(echo "$input" | tr -cd '[:alnum:]_-')
-        [ -z "$sanitized" ] && { log ERROR "Nama tidak valid"; exit 1; }
+        [ -z "$sanitized" ] && { log ERROR "Nama node tidak valid."; exit 1; }
         echo "$sanitized" > "$NODE_CONFIG"
     fi
     cat "$NODE_CONFIG"
 }
 
-# ─── DISK SPACE CHECK ────────────────────────────────────────
+# ─── PEMERIKSAAN RUANG DISK ───────────────────────────────────
 check_disk_space() {
     local src="$1"
     local src_mb; src_mb=$(du -sm "$src" 2>/dev/null | awk '{print $1}')
     local free_mb; free_mb=$(df -m "$TEMP_DIR" | awk 'NR==2{print $4}')
     local need_mb=$(( src_mb + 512 ))
 
-    log STEP "Source: ${src_mb}MB | Free: ${free_mb}MB | Required: ${need_mb}MB"
+    log STEP "Ukuran sumber: ${src_mb}MB | Ruang tersedia: ${free_mb}MB | Diperlukan: ${need_mb}MB"
     [ "$free_mb" -ge "$need_mb" ] && return 0
 
-    log ERROR "Disk tidak cukup! Free=${free_mb}MB, Butuh=${need_mb}MB"
+    log ERROR "Ruang disk tidak mencukupi. Tersedia: ${free_mb}MB, Diperlukan: ${need_mb}MB."
     exit 1
 }
 
-# ─── RCLONE WITH RETRY ───────────────────────────────────────
+# ─── RCLONE DENGAN MEKANISME PERCOBAAN ULANG ─────────────────
 rclone_retry() {
     local op="$1"; shift
     local attempt=1
@@ -327,38 +302,32 @@ rclone_retry() {
             --low-level-retries=10 \
             --stats=30s \
             && return 0
-        log WARN "Attempt $attempt/$MAX_RETRIES gagal — retry 15s..."
+        log WARN "Percobaan $attempt/$MAX_RETRIES gagal — mencoba ulang dalam 15 detik..."
         sleep 15
         (( attempt++ )) || true
     done
-    log ERROR "Gagal setelah $MAX_RETRIES attempts"
+    log ERROR "Operasi gagal setelah $MAX_RETRIES percobaan."
     return 1
 }
 
-# ─── SMART COMPRESSION [FIX #4] ──────────────────────────────
-# Gunakan 'nice' untuk menurunkan prioritas CPU proses tar.
-# Deteksi jumlah CPU core; jika tersedia pigz, gunakan --use-compress-program
-# untuk parallel compression. Fallback ke gzip single-thread jika pigz tidak ada.
+# ─── KOMPRESI CERDAS ─────────────────────────────────────────
 smart_compress() {
-    local src_dir="$1"    # direktori parent (-C target)
-    local src_name="$2"   # nama relatif yang dikompress
-    local dest="$3"       # path output .tar.gz
+    local src_dir="$1"
+    local src_name="$2"
+    local dest="$3"
 
     local cpu_count
     cpu_count=$(nproc 2>/dev/null || echo 1)
 
-    # Turunkan prioritas CPU agar tidak mengganggu proses lain (nice=10)
-    # ionice -c3 = idle I/O class (jika tersedia)
     local nice_prefix="nice -n 10"
     if command -v ionice &>/dev/null; then
         nice_prefix="ionice -c3 nice -n 10"
     fi
 
     if command -v pigz &>/dev/null; then
-        # pigz: parallel gzip — gunakan setengah CPU agar tidak monopoli
         local threads=$(( cpu_count / 2 ))
         [ "$threads" -lt 1 ] && threads=1
-        log STEP "Kompresi parallel (pigz, $threads threads, nice=10)..."
+        log STEP "Kompresi paralel menggunakan pigz ($threads thread, prioritas rendah)..."
         $nice_prefix tar \
             --use-compress-program="pigz -p $threads" \
             -f "$dest" \
@@ -366,8 +335,7 @@ smart_compress() {
             --checkpoint-action=dot \
             -c -C "$src_dir" "$src_name" 2>/dev/null
     else
-        # Fallback: gzip single-thread dengan nice
-        log STEP "Kompresi gzip standard (nice=10)..."
+        log STEP "Kompresi menggunakan gzip standar (prioritas rendah)..."
         $nice_prefix tar \
             -czf "$dest" \
             --checkpoint=500 \
@@ -376,104 +344,96 @@ smart_compress() {
     fi
 }
 
-# ─── BACKUP ──────────────────────────────────────────────────
+# ─── PROSES BACKUP ───────────────────────────────────────────
 do_backup() {
     local node; node=$(get_node_name)
     local stamp; stamp=$(date +%Y-%m-%d_%H-%M-%S)
     local fname="${node}_${stamp}.tar.gz"
     local tmpf="$TEMP_DIR/$fname"
 
-    echo -e "\n${CYAN}${BOLD}═══════ BACKUP MODE ═══════${NC}"
-    log STEP "Node: $node | Target: $fname"
+    echo -e "\n${CYAN}${BOLD}═══════ MODE BACKUP ═══════${NC}"
+    log STEP "Node: $node | File target: $fname"
 
-    [ -d "$PTERO_PATH" ] || { log ERROR "Path tidak ada: $PTERO_PATH"; exit 1; }
+    [ -d "$PTERO_PATH" ] || { log ERROR "Direktori tidak ditemukan: $PTERO_PATH"; exit 1; }
 
     mkdir -p "$TEMP_DIR"
     check_disk_space "$PTERO_PATH"
 
-    # Resolve remote target (dengan Folder ID jika tersedia)
     local remote_target
     remote_target=$(get_remote_target)
-    log STEP "Remote target: $remote_target"
+    log STEP "Tujuan remote: $remote_target"
 
-    # Stop Wings sebelum backup agar CPU tidak overload
     local wings_was_running=false
     if systemctl is-active --quiet wings 2>/dev/null; then
-        log STEP "Menghentikan Wings sementara untuk backup..."
+        log STEP "Menghentikan Wings sementara selama proses backup..."
         if systemctl stop wings 2>/dev/null; then
             wings_was_running=true
-            log INFO "Wings dihentikan ✓"
+            log INFO "Wings berhasil dihentikan."
         else
-            log WARN "Gagal menghentikan Wings — backup tetap dilanjutkan"
+            log WARN "Gagal menghentikan Wings — proses backup tetap dilanjutkan."
         fi
     else
-        log INFO "Wings tidak aktif — lanjut backup"
+        log INFO "Wings tidak aktif — melanjutkan proses backup."
     fi
 
-    # Compress — [FIX #4] Smart compression dengan nice + pigz jika ada
     local t0=$SECONDS
     smart_compress "/var/lib/pterodactyl" "volumes" "$tmpf"
     echo ""
     local elapsed=$(( SECONDS - t0 ))
     local fsize; fsize=$(du -sh "$tmpf" | awk '{print $1}')
-    log INFO "Kompresi selesai: ${fsize} dalam ${elapsed}s"
+    log INFO "Kompresi selesai: ${fsize} dalam ${elapsed} detik."
 
-    # Upload — [FIX #1] Gunakan remote_target (Folder ID aware)
-    log STEP "Upload ke Google Drive..."
+    log STEP "Mengunggah ke Google Drive..."
     rclone_retry copy "$tmpf" "$remote_target" \
-        || { log ERROR "Upload gagal!"; exit 1; }
+        || { log ERROR "Pengunggahan gagal."; exit 1; }
 
     rm -f "$tmpf"
 
-    # Restart Wings jika sebelumnya aktif
     if $wings_was_running; then
-        log STEP "Menghidupkan kembali Wings..."
+        log STEP "Menjalankan kembali Wings..."
         if systemctl start wings 2>/dev/null; then
             sleep 3
             if systemctl is-active --quiet wings 2>/dev/null; then
-                log INFO "Wings RUNNING kembali ✓"
+                log INFO "Wings kembali berjalan."
             else
-                log WARN "Wings gagal start — cek: systemctl status wings"
+                log WARN "Wings gagal dijalankan — periksa dengan: systemctl status wings"
             fi
         else
-            log WARN "Gagal menjalankan Wings — jalankan manual: systemctl start wings"
+            log WARN "Gagal menjalankan Wings — jalankan secara manual: systemctl start wings"
         fi
     fi
 
-    # Retention cleanup — [FIX #2] || true sudah ada, tapi pastikan eksplisit
-    log STEP "Hapus backup >${RETENTION_DAYS} hari..."
+    log STEP "Menghapus backup yang lebih lama dari ${RETENTION_DAYS} hari..."
     rclone delete "$remote_target" \
         --min-age "${RETENTION_DAYS}d" \
         --include "${node}_*.tar.gz" 2>/dev/null || true
 
     echo -e "\n${GREEN}${BOLD}╔══════════════════════════════════════╗"
-    echo -e "║       ✅ BACKUP SUKSES! GACOR!        ║"
+    echo -e "║         ✅ BACKUP BERHASIL!           ║"
     echo -e "╠══════════════════════════════════════╣"
     echo -e "║${NC} Node  : ${BOLD}$node${NC}"
     echo -e "${GREEN}${BOLD}║${NC} File  : ${BOLD}$fname${NC}"
-    echo -e "${GREEN}${BOLD}║${NC} Size  : ${BOLD}$fsize${NC}"
+    echo -e "${GREEN}${BOLD}║${NC} Ukuran: ${BOLD}$fsize${NC}"
     echo -e "${GREEN}${BOLD}║${NC} Drive : ${BOLD}$remote_target${NC}"
     echo -e "${GREEN}${BOLD}╚══════════════════════════════════════╝${NC}"
 
-    log INFO "BACKUP COMPLETE: $fname ($fsize)"
+    log INFO "BACKUP SELESAI: $fname ($fsize)"
 }
 
-# ─── RESTORE ─────────────────────────────────────────────────
+# ─── PROSES RESTORE ──────────────────────────────────────────
 do_restore() {
-    echo -e "\n${CYAN}${BOLD}═══════ RESTORE MODE ═══════${NC}"
-    log STEP "Mengambil daftar backup dari GDrive..."
+    echo -e "\n${CYAN}${BOLD}═══════ MODE RESTORE ═══════${NC}"
+    log STEP "Mengambil daftar backup dari Google Drive..."
 
-    # [FIX #1] Gunakan remote_target yang Folder ID aware
     local remote_target
     remote_target=$(get_remote_target)
 
-    # [FIX #2] Jangan biarkan kegagalan lsf membunuh script
     local list
     list=$(rclone lsf "$remote_target" --include "*.tar.gz" 2>/dev/null | sort -r) || true
 
-    [ -z "$list" ] && { log ERROR "Tidak ada backup di GDrive! (target: $remote_target)"; exit 1; }
+    [ -z "$list" ] && { log ERROR "Tidak ada backup yang tersedia di Google Drive. (target: $remote_target)"; exit 1; }
 
-    echo -e "\n${YELLOW}${BOLD}Daftar Backup:${NC}"
+    echo -e "\n${YELLOW}${BOLD}Daftar Backup yang Tersedia:${NC}"
     echo -e "${CYAN}──────────────────────────────────────────────${NC}"
 
     local -a files
@@ -481,7 +441,6 @@ do_restore() {
     while IFS= read -r f; do
         files+=("$f")
         local sz
-        # [FIX #2] Jangan biarkan kegagalan size query membunuh script
         sz=$(rclone size "$remote_target/$f" --json 2>/dev/null \
             | python3 -c "import sys,json; d=json.load(sys.stdin); mb=d['bytes']//1024//1024; print(f'{mb}MB')" \
             2>/dev/null || echo "?") || sz="?"
@@ -491,107 +450,99 @@ do_restore() {
 
     echo -e "${CYAN}──────────────────────────────────────────────${NC}"
     echo ""
-    read -rp "Pilih nomor (1-${#files[@]}): " num
+    read -rp "Pilih nomor backup (1-${#files[@]}): " num
 
     [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le "${#files[@]}" ] \
-        || { log ERROR "Nomor tidak valid!"; exit 1; }
+        || { log ERROR "Nomor yang dimasukkan tidak valid."; exit 1; }
 
     local rfile="${files[$((num-1))]}"
 
-    # Konfirmasi destruktif
-    echo -e "\n${RED}${BOLD}⚠️  PERINGATAN: OPERASI INI TIDAK BISA DIBATALKAN! ⚠️${NC}"
-    echo -e "${RED}  • Semua isi $PTERO_PATH akan dihapus${NC}"
+    echo -e "\n${RED}${BOLD}⚠️  PERINGATAN: TINDAKAN INI TIDAK DAPAT DIBATALKAN! ⚠️${NC}"
+    echo -e "${RED}  • Seluruh isi $PTERO_PATH akan dihapus.${NC}"
     echo -e "${YELLOW}  • File   : $rfile${NC}"
-    echo -e "${YELLOW}  • Backup lama akan dipindah ke /root/volumes_snapshot_*${NC}"
+    echo -e "${YELLOW}  • Data lama akan dipindahkan ke /root/volumes_snapshot_*${NC}"
     echo ""
-    read -rp "Ketik ${BOLD}RESTORE${NC} untuk lanjut: " confirm
-    [ "$confirm" == "RESTORE" ] || { log WARN "Dibatalkan"; exit 0; }
+    read -rp "Ketik ${BOLD}RESTORE${NC} untuk melanjutkan: " confirm
+
+    [ "$confirm" == "RESTORE" ] || { log WARN "Proses restore dibatalkan."; exit 0; }
 
     mkdir -p "$TEMP_DIR"
     local local_file="$TEMP_DIR/$rfile"
 
-    # Download
-    log STEP "Mendownload: $rfile"
+    log STEP "Mengunduh file: $rfile"
     rclone_retry copy "$remote_target/$rfile" "$TEMP_DIR/" \
-        || { log ERROR "Download gagal!"; exit 1; }
+        || { log ERROR "Pengunduhan gagal."; exit 1; }
 
-    # Integrity check
-    log STEP "Verifikasi integritas archive..."
+    log STEP "Memverifikasi integritas arsip..."
     tar -tzf "$local_file" >/dev/null 2>&1 \
-        || { log ERROR "File corrupt!"; rm -f "$local_file"; exit 1; }
-    log INFO "Archive OK"
+        || { log ERROR "File backup rusak atau tidak dapat dibaca."; rm -f "$local_file"; exit 1; }
+    log INFO "Arsip valid."
 
-    # Stop wings
     local wings_up=false
     if systemctl is-active --quiet wings 2>/dev/null; then
         log STEP "Menghentikan Wings..."
         systemctl stop wings && wings_up=true
     fi
 
-    # Snapshot data lama
     local snap="/root/volumes_snapshot_$(date +%H%M%S)"
     if [ -d "$PTERO_PATH" ] && [ "$(ls -A "$PTERO_PATH" 2>/dev/null)" ]; then
-        log STEP "Snapshot lama → $snap"
+        log STEP "Memindahkan data lama ke: $snap"
         mv "$PTERO_PATH" "$snap" 2>/dev/null || true
     fi
     mkdir -p "$PTERO_PATH"
 
-    # Extract
     log STEP "Mengekstrak backup..."
     tar -xzf "$local_file" \
         --checkpoint=500 \
         --checkpoint-action=dot \
         -C /var/lib/pterodactyl 2>/dev/null
     echo ""
-    log INFO "Ekstraksi selesai"
+    log INFO "Ekstraksi selesai."
 
-    # Fix permissions
-    log STEP "Fix permissions..."
+    log STEP "Memperbaiki izin akses direktori..."
     local ptero_uid
     ptero_uid=$(id -u pterodactyl 2>/dev/null || echo "988")
     chown -R "${ptero_uid}:${ptero_uid}" "$PTERO_PATH" 2>/dev/null || true
     chmod -R 755 "$PTERO_PATH" 2>/dev/null || true
 
-    # Restart wings
     if $wings_up; then
-        log STEP "Menghidupkan Wings..."
+        log STEP "Menjalankan kembali Wings..."
         systemctl start wings && sleep 3
         systemctl is-active --quiet wings \
-            && log INFO "Wings RUNNING ✓" \
-            || log WARN "Wings gagal start — cek: systemctl status wings"
+            && log INFO "Wings kembali berjalan." \
+            || log WARN "Wings gagal dijalankan — periksa dengan: systemctl status wings"
     fi
 
     rm -f "$local_file"
 
     echo -e "\n${GREEN}${BOLD}╔══════════════════════════════════════╗"
-    echo -e "║      ✅ RESTORE SUKSES! MANTAP!       ║"
+    echo -e "║         ✅ RESTORE BERHASIL!          ║"
     echo -e "╠══════════════════════════════════════╣"
     echo -e "║${NC} File     : ${BOLD}$rfile${NC}"
     echo -e "${GREEN}${BOLD}║${NC} Snapshot : ${BOLD}$snap${NC}"
     echo -e "${GREEN}${BOLD}╚══════════════════════════════════════╝${NC}"
 
-    log INFO "RESTORE COMPLETE: $rfile"
+    log INFO "RESTORE SELESAI: $rfile"
 }
 
-# ─── CRON SCHEDULER ──────────────────────────────────────────
+# ─── PENJADWALAN OTOMATIS (CRON) ─────────────────────────────
 setup_cron() {
-    echo -e "\n${CYAN}${BOLD}═══════ AUTO BACKUP SCHEDULER ═══════${NC}"
+    echo -e "\n${CYAN}${BOLD}═══════ JADWAL BACKUP OTOMATIS ═══════${NC}"
     echo -e "  ${BOLD}1.${NC} Setiap 6 jam"
     echo -e "  ${BOLD}2.${NC} Setiap 12 jam"
-    echo -e "  ${BOLD}3.${NC} Setiap hari jam 02:00"
-    echo -e "  ${BOLD}4.${NC} Setiap hari jam 00:00 & 12:00"
-    echo -e "  ${BOLD}5.${NC} Custom cron expression"
-    echo -e "  ${BOLD}6.${NC} ❌ Hapus jadwal"
+    echo -e "  ${BOLD}3.${NC} Setiap hari pukul 02:00"
+    echo -e "  ${BOLD}4.${NC} Setiap hari pukul 00:00 & 12:00"
+    echo -e "  ${BOLD}5.${NC} Ekspresi cron kustom"
+    echo -e "  ${BOLD}6.${NC} ❌ Hapus jadwal yang ada"
     echo ""
     read -rp "Pilihan (1-6): " choice
 
     local script_path="/usr/local/bin/bimxyz"
     local cron_cmd="bash $script_path --auto-backup >> $LOG_FILE 2>&1"
 
-    # Hapus entry lama dulu — [FIX #2] || true eksplisit
     crontab -l 2>/dev/null | grep -v "$script_path" | crontab - 2>/dev/null || true
 
-    [ "$choice" == "6" ] && { log INFO "Jadwal dihapus"; return 0; }
+    [ "$choice" == "6" ] && { log INFO "Jadwal backup otomatis berhasil dihapus."; return 0; }
 
     local expr
     case "$choice" in
@@ -599,72 +550,63 @@ setup_cron() {
         2) expr="0 */12 * * *" ;;
         3) expr="0 2 * * *" ;;
         4) expr="0 0,12 * * *" ;;
-        5) read -rp "Cron expression: " expr ;;
-        *) log ERROR "Tidak valid"; return 1 ;;
+        5) read -rp "Masukkan ekspresi cron: " expr ;;
+        *) log ERROR "Pilihan tidak valid."; return 1 ;;
     esac
 
     ( crontab -l 2>/dev/null; echo "$expr $cron_cmd" ) | crontab -
-    log INFO "Cron aktif: [$expr]"
-    echo -e "${GREEN}Verifikasi: ${YELLOW}crontab -l${NC}"
+    log INFO "Jadwal backup otomatis aktif: [$expr]"
+    echo -e "${GREEN}Verifikasi jadwal dengan perintah: ${YELLOW}crontab -l${NC}"
 }
 
-# ─── STATUS DASHBOARD [FIX #3] ───────────────────────────────
-# Setiap blok pengecekan dijalankan secara independen dengan || true
-# sehingga error di satu blok tidak mencegah blok lain tampil.
+# ─── DASBOR STATUS SISTEM ────────────────────────────────────
 show_status() {
-    echo -e "\n${CYAN}${BOLD}═══════ SYSTEM STATUS ═══════${NC}"
+    echo -e "\n${CYAN}${BOLD}═══════ STATUS SISTEM ═══════${NC}"
 
-    # Node name — aman, tidak bisa gagal
-    local node="(belum diset)"
-    [ -f "$NODE_CONFIG" ] && node=$(cat "$NODE_CONFIG" 2>/dev/null || echo "(belum diset)")
-    echo -e "  Node       : ${BOLD}$node${NC}"
+    local node="(belum dikonfigurasi)"
+    [ -f "$NODE_CONFIG" ] && node=$(cat "$NODE_CONFIG" 2>/dev/null || echo "(belum dikonfigurasi)")
+    echo -e "  Node         : ${BOLD}$node${NC}"
 
-    # GDrive status — blok independen, tidak bunuh dashboard jika error
     {
         if gdrive_is_alive 2>/dev/null; then
             local remote_target; remote_target=$(get_remote_target 2>/dev/null || echo "$REMOTE_NAME:$GDRIVE_FOLDER")
             local count
-            # [FIX #2] grep pada output kosong tidak boleh kill script
             count=$(rclone lsf "$remote_target" --include "*.tar.gz" 2>/dev/null | wc -l) || count="?"
-            echo -e "  GDrive     : ${GREEN}${BOLD}CONNECTED ✓${NC} ($count backups)"
+            echo -e "  Google Drive : ${GREEN}${BOLD}TERHUBUNG ✓${NC} ($count backup tersedia)"
         else
-            echo -e "  GDrive     : ${RED}${BOLD}DISCONNECTED ✗${NC}"
+            echo -e "  Google Drive : ${RED}${BOLD}TIDAK TERHUBUNG ✗${NC}"
         fi
-    } || echo -e "  GDrive     : ${YELLOW}${BOLD}CEK GAGAL${NC}"
+    } || echo -e "  Google Drive : ${YELLOW}${BOLD}PEMERIKSAAN GAGAL${NC}"
 
-    # Disk usage — blok independen
     {
         local disk
-        disk=$(df -h "$PTERO_PATH" 2>/dev/null | awk 'NR==2{printf "%s used / %s total (%s)", $3,$2,$5}') \
+        disk=$(df -h "$PTERO_PATH" 2>/dev/null | awk 'NR==2{printf "%s terpakai / %s total (%s)", $3,$2,$5}') \
             || disk="(tidak dapat dibaca)"
-        echo -e "  Disk       : ${BOLD}$disk${NC}"
-    } || echo -e "  Disk       : ${YELLOW}${BOLD}CEK GAGAL${NC}"
+        echo -e "  Disk         : ${BOLD}$disk${NC}"
+    } || echo -e "  Disk         : ${YELLOW}${BOLD}PEMERIKSAAN GAGAL${NC}"
 
-    # Wings status — blok independen
     {
         if systemctl is-active --quiet wings 2>/dev/null; then
-            echo -e "  Wings      : ${GREEN}${BOLD}RUNNING ✓${NC}"
+            echo -e "  Wings        : ${GREEN}${BOLD}BERJALAN ✓${NC}"
         else
-            echo -e "  Wings      : ${RED}${BOLD}STOPPED${NC}"
+            echo -e "  Wings        : ${RED}${BOLD}BERHENTI${NC}"
         fi
-    } || echo -e "  Wings      : ${YELLOW}${BOLD}CEK GAGAL${NC}"
+    } || echo -e "  Wings        : ${YELLOW}${BOLD}PEMERIKSAAN GAGAL${NC}"
 
-    # Cron status — [FIX #2] grep tidak boleh membunuh script jika tidak ada hasil
     {
         local cron_entry
         cron_entry=$(crontab -l 2>/dev/null | grep "/usr/local/bin/bimxyz" || true)
         if [ -n "$cron_entry" ]; then
-            echo -e "  Auto-Backup: ${GREEN}${BOLD}AKTIF${NC} → $cron_entry"
+            echo -e "  Backup Otomatis: ${GREEN}${BOLD}AKTIF${NC} → $cron_entry"
         else
-            echo -e "  Auto-Backup: ${YELLOW}${BOLD}TIDAK AKTIF${NC}"
+            echo -e "  Backup Otomatis: ${YELLOW}${BOLD}TIDAK AKTIF${NC}"
         fi
-    } || echo -e "  Auto-Backup: ${YELLOW}${BOLD}CEK GAGAL${NC}"
+    } || echo -e "  Backup Otomatis: ${YELLOW}${BOLD}PEMERIKSAAN GAGAL${NC}"
 
-    # Last operation — [FIX #2] grep tidak boleh membunuh script
     {
         local last
-        last=$(grep "BACKUP COMPLETE\|RESTORE COMPLETE" "$LOG_FILE" 2>/dev/null | tail -1 || true)
-        [ -n "$last" ] && echo -e "  Last Op    : ${BOLD}$(echo "$last" | cut -d' ' -f1-3)${NC} — $(echo "$last" | cut -d']' -f3-)"
+        last=$(grep "BACKUP SELESAI\|RESTORE SELESAI" "$LOG_FILE" 2>/dev/null | tail -1 || true)
+        [ -n "$last" ] && echo -e "  Operasi Terakhir: ${BOLD}$(echo "$last" | cut -d' ' -f1-3)${NC} — $(echo "$last" | cut -d']' -f3-)"
     } || true
 
     echo ""
@@ -681,14 +623,14 @@ show_banner() {
     echo -e "  ${YELLOW}Log: $LOG_FILE${NC}\n"
 }
 
-# ─── MENU ────────────────────────────────────────────────────
+# ─── MENU UTAMA ───────────────────────────────────────────────
 show_menu() {
     echo -e "\n${CYAN}${BOLD}MENU UTAMA:${NC}"
-    echo -e "  ${BOLD}1.${NC} 🚀 Backup Sekarang"
-    echo -e "  ${BOLD}2.${NC} 📥 Restore Backup"
-    echo -e "  ${BOLD}3.${NC} ⏰ Setup Auto Backup"
-    echo -e "  ${BOLD}4.${NC} 📊 Lihat Status"
-    echo -e "  ${BOLD}5.${NC} 🔄 Reset GDrive Auth"
+    echo -e "  ${BOLD}1.${NC} 🚀 Jalankan Backup Sekarang"
+    echo -e "  ${BOLD}2.${NC} 📥 Pulihkan Backup (Restore)"
+    echo -e "  ${BOLD}3.${NC} ⏰ Atur Backup Otomatis"
+    echo -e "  ${BOLD}4.${NC} 📊 Lihat Status Sistem"
+    echo -e "  ${BOLD}5.${NC} 🔄 Reset Autentikasi Google Drive"
     echo -e "  ${BOLD}6.${NC} 🚪 Keluar"
     echo ""
     read -rp "Pilihan (1-6): " choice
@@ -701,23 +643,22 @@ show_menu() {
         5)
             rclone config delete "$REMOTE_NAME" 2>/dev/null || true
             rm -f "$CONFIG_DIR/service_account.json"
-            rm -f "$FOLDER_ID_CACHE"   # Invalidasi cache Folder ID
-            log INFO "Auth direset. Jalankan ulang."
+            rm -f "$FOLDER_ID_CACHE"
+            log INFO "Autentikasi berhasil direset. Jalankan skrip kembali untuk mengonfigurasi ulang."
             ;;
         6) exit 0 ;;
-        *) log ERROR "Pilihan tidak valid" ;;
+        *) log ERROR "Pilihan tidak valid." ;;
     esac
 }
 
-# ─── ENTRY POINT ─────────────────────────────────────────────
+# ─── TITIK MASUK UTAMA ───────────────────────────────────────
 main() {
     check_root
     mkdir -p "$CONFIG_DIR"
     touch "$LOG_FILE"
 
-    # Mode otomatis dari cron — langsung backup, no menu
     if [ "${1:-}" == "--auto-backup" ]; then
-        log INFO "=== CRON AUTO-BACKUP TRIGGERED ==="
+        log INFO "=== BACKUP OTOMATIS DIMULAI (CRON) ==="
         install_deps
         setup_gdrive
         do_backup
