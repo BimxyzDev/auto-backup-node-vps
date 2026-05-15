@@ -1,13 +1,13 @@
 #!/bin/bash
-# ╔═══════════════════════════════════════════════════════════╗
-# ║     BIMXYZ ULTIMATE BACKUP SYSTEM V4.1                   ║
-# ║     Production Grade | Multi-Server | Auto-Retry         ║
-# ╚═══════════════════════════════════════════════════════════╝
+# ╔══════════════════════════════════════════════════════════════╗
+# ║   BIMXYZ ULTIMATE BACKUP SYSTEM V5.0                        ║
+# ║   Enterprise Grade | Multi-Server | Timezone-Aware Cron     ║
+# ╚══════════════════════════════════════════════════════════════╝
 
 set -uo pipefail
 
-# ─── KONSTANTA ───────────────────────────────────────────────
-readonly VERSION="4.1"
+# ─── KONSTANTA ────────────────────────────────────────────────
+readonly VERSION="5.0"
 readonly REMOTE_NAME="gdrive_bimxyz"
 readonly GDRIVE_FOLDER="Backup_Bimxyz"
 readonly PTERO_PATH="/var/lib/pterodactyl/volumes"
@@ -16,14 +16,15 @@ readonly TEMP_DIR="/root/.bimxyz_temp"
 readonly NODE_CONFIG="$CONFIG_DIR/node.conf"
 readonly FOLDER_ID_CACHE="$CONFIG_DIR/gdrive_folder_id.cache"
 readonly LOG_FILE="/var/log/bimxyz_backup.log"
+readonly SCRIPT_PATH="/usr/local/bin/bimxyz"
 readonly MAX_RETRIES=3
 readonly RETENTION_DAYS=7
 
-# ─── WARNA ───────────────────────────────────────────────────
+# ─── WARNA ────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'
 YELLOW='\033[1;33m'; BOLD='\033[1m'; NC='\033[0m'
 
-# ─── LOGGING ─────────────────────────────────────────────────
+# ─── LOGGING ──────────────────────────────────────────────────
 log() {
     local level="$1"; shift
     local msg="$*"
@@ -37,23 +38,23 @@ log() {
     esac
 }
 
-# ─── PEMBERSIHAN ─────────────────────────────────────────────
+# ─── PEMBERSIHAN ──────────────────────────────────────────────
 cleanup() {
     local code=$?
     [ -d "$TEMP_DIR" ] && rm -rf "$TEMP_DIR"
-    [ $code -ne 0 ] && log ERROR "Proses dihentikan (kode: $code) — periksa log: $LOG_FILE"
+    [ $code -ne 0 ] && log ERROR "Proses dihentikan (kode keluar: $code) — periksa log: $LOG_FILE"
 }
 trap cleanup EXIT
 trap 'log ERROR "Proses dibatalkan oleh pengguna."; exit 130' INT TERM
 
-# ─── PEMERIKSAAN HAK AKSES ROOT ──────────────────────────────
+# ─── PEMERIKSAAN HAK AKSES ROOT ───────────────────────────────
 check_root() {
     [ "$EUID" -eq 0 ] && return
     echo -e "${RED}[✗] Skrip ini harus dijalankan sebagai root. Gunakan: sudo bash $0${NC}"
     exit 1
 }
 
-# ─── INSTALASI DEPENDENSI ────────────────────────────────────
+# ─── INSTALASI DEPENDENSI ─────────────────────────────────────
 install_deps() {
     local missing=()
     command -v rclone  &>/dev/null || missing+=("rclone")
@@ -63,7 +64,7 @@ install_deps() {
 
     [ ${#missing[@]} -eq 0 ] && return 0
 
-    log STEP "Menginstal dependensi: ${missing[*]}"
+    log STEP "Menginstal dependensi yang diperlukan: ${missing[*]}"
     for dep in "${missing[@]}"; do
         if [ "$dep" == "rclone" ]; then
             curl -fsSL https://rclone.org/install.sh | bash >/dev/null 2>&1 \
@@ -73,111 +74,72 @@ install_deps() {
                 || { log ERROR "Gagal menginstal $dep."; exit 1; }
         fi
     done
-    log INFO "Semua dependensi berhasil diinstal."
+    log INFO "Seluruh dependensi berhasil diinstal."
 }
 
-# ─── PERBAIKAN OTOMATIS KONFIGURASI RCLONE ───────────────────
+# ─── PERBAIKAN OTOMATIS KONFIGURASI RCLONE ────────────────────
 auto_repair_rclone_config() {
     local sa_file="$CONFIG_DIR/service_account.json"
 
-    if rclone listremotes 2>/dev/null | grep -q "^${REMOTE_NAME}:$"; then
-        return 0
-    fi
-
+    rclone listremotes 2>/dev/null | grep -q "^${REMOTE_NAME}:$" && return 0
     [ -f "$sa_file" ] || return 1
 
-    log WARN "Remote '$REMOTE_NAME' tidak ditemukan di konfigurasi rclone — mencoba perbaikan otomatis..."
+    log WARN "Remote '$REMOTE_NAME' tidak ditemukan — menjalankan perbaikan otomatis..."
 
-    if ! python3 -c "import json,sys; json.load(open('$sa_file'))" 2>/dev/null; then
-        log ERROR "File service_account.json tidak valid — perbaikan otomatis dibatalkan."
-        return 1
-    fi
+    python3 -c "import json,sys; json.load(open('$sa_file'))" 2>/dev/null \
+        || { log ERROR "File service_account.json tidak valid — perbaikan dibatalkan."; return 1; }
 
     rclone config create "$REMOTE_NAME" drive \
         service_account_file="$sa_file" \
         scope=drive \
-        --non-interactive >/dev/null 2>&1 || {
-        log ERROR "Perbaikan otomatis gagal membuat remote."
-        return 1
-    }
+        --non-interactive >/dev/null 2>&1 \
+        || { log ERROR "Perbaikan otomatis gagal membuat remote."; return 1; }
 
     log INFO "Perbaikan otomatis konfigurasi rclone berhasil."
-    return 0
 }
 
-# ─── PENCARIAN FOLDER ID GOOGLE DRIVE ────────────────────────
+# ─── PENCARIAN FOLDER ID GOOGLE DRIVE ─────────────────────────
+_gdrive_lsjson_find() {
+    python3 -c "
+import json, sys
+items = json.load(sys.stdin)
+for item in items:
+    if item.get('IsDir') and item.get('Name') == '${GDRIVE_FOLDER}':
+        print(item.get('ID', ''))
+        break
+" 2>/dev/null || echo ""
+}
+
 resolve_gdrive_folder_id() {
     if [ -f "$FOLDER_ID_CACHE" ]; then
-        local cache_age
-        cache_age=$(( $(date +%s) - $(stat -c %Y "$FOLDER_ID_CACHE" 2>/dev/null || echo 0) ))
-        if [ "$cache_age" -lt 86400 ]; then
-            cat "$FOLDER_ID_CACHE"
-            return 0
-        fi
+        local age=$(( $(date +%s) - $(stat -c %Y "$FOLDER_ID_CACHE" 2>/dev/null || echo 0) ))
+        [ "$age" -lt 86400 ] && { cat "$FOLDER_ID_CACHE"; return 0; }
     fi
 
-    log STEP "Mencari Folder ID untuk '$GDRIVE_FOLDER' (Drive Utama & Dibagikan ke Saya)..."
+    log STEP "Mencari Folder ID untuk '$GDRIVE_FOLDER'..."
 
-    local folder_id=""
+    local folder_id
+    folder_id=$(rclone lsjson "$REMOTE_NAME:" --drive-trashed-only=false 2>/dev/null | _gdrive_lsjson_find)
 
-    # Pencarian di Drive Utama
-    folder_id=$(rclone lsjson "$REMOTE_NAME:" \
-        --drive-trashed-only=false 2>/dev/null \
-        | python3 -c "
-import json, sys
-items = json.load(sys.stdin)
-for item in items:
-    if item.get('IsDir') and item.get('Name') == '${GDRIVE_FOLDER}':
-        print(item.get('ID', ''))
-        break
-" 2>/dev/null || echo "")
-
-    # Pencarian di folder "Dibagikan ke Saya"
     if [ -z "$folder_id" ]; then
-        log STEP "Folder tidak ditemukan di Drive Utama — mencari di folder 'Dibagikan ke Saya'..."
-        folder_id=$(rclone lsjson "$REMOTE_NAME:" \
-            --drive-shared-with-me \
-            --drive-trashed-only=false 2>/dev/null \
-            | python3 -c "
-import json, sys
-items = json.load(sys.stdin)
-for item in items:
-    if item.get('IsDir') and item.get('Name') == '${GDRIVE_FOLDER}':
-        print(item.get('ID', ''))
-        break
-" 2>/dev/null || echo "")
+        log STEP "Tidak ditemukan di Drive Utama — mencari di folder 'Dibagikan ke Saya'..."
+        folder_id=$(rclone lsjson "$REMOTE_NAME:" --drive-shared-with-me --drive-trashed-only=false 2>/dev/null | _gdrive_lsjson_find)
     fi
 
     if [ -z "$folder_id" ]; then
-        # Buat folder baru jika tidak ditemukan di mana pun
-        log WARN "Folder '$GDRIVE_FOLDER' tidak ditemukan — membuat folder baru di Drive Utama..."
-        rclone mkdir "$REMOTE_NAME:$GDRIVE_FOLDER" 2>/dev/null || {
-            log ERROR "Gagal membuat folder '$GDRIVE_FOLDER' di Google Drive."
-            return 1
-        }
-        folder_id=$(rclone lsjson "$REMOTE_NAME:" \
-            --drive-trashed-only=false 2>/dev/null \
-            | python3 -c "
-import json, sys
-items = json.load(sys.stdin)
-for item in items:
-    if item.get('IsDir') and item.get('Name') == '${GDRIVE_FOLDER}':
-        print(item.get('ID', ''))
-        break
-" 2>/dev/null || echo "")
+        log WARN "Folder '$GDRIVE_FOLDER' tidak ditemukan — membuat folder baru..."
+        rclone mkdir "$REMOTE_NAME:$GDRIVE_FOLDER" 2>/dev/null \
+            || { log ERROR "Gagal membuat folder '$GDRIVE_FOLDER' di Google Drive."; return 1; }
+        folder_id=$(rclone lsjson "$REMOTE_NAME:" --drive-trashed-only=false 2>/dev/null | _gdrive_lsjson_find)
     fi
 
-    if [ -z "$folder_id" ]; then
-        log ERROR "Gagal mendapatkan Folder ID untuk '$GDRIVE_FOLDER'."
-        return 1
-    fi
+    [ -z "$folder_id" ] && { log ERROR "Gagal mendapatkan Folder ID untuk '$GDRIVE_FOLDER'."; return 1; }
 
     echo "$folder_id" > "$FOLDER_ID_CACHE"
-    log INFO "Folder ID ditemukan: $folder_id (disimpan ke cache)."
+    log INFO "Folder ID ditemukan: $folder_id (tersimpan di cache)."
     echo "$folder_id"
 }
 
-# Mendapatkan path remote berdasarkan Folder ID (jika tersedia)
 get_remote_target() {
     local folder_id
     folder_id=$(resolve_gdrive_folder_id 2>/dev/null || echo "")
@@ -192,7 +154,6 @@ get_remote_target() {
 gdrive_is_alive() {
     rclone listremotes 2>/dev/null | grep -q "^${REMOTE_NAME}:$" || return 1
     rclone lsd "$REMOTE_NAME:" &>/dev/null || return 1
-    return 0
 }
 
 setup_gdrive() {
@@ -246,7 +207,7 @@ setup_service_account() {
 }
 
 setup_oauth() {
-    echo -e "\n${CYAN}Jalankan perintah berikut di Termux, lalu masuk dengan akun Google Drive yang ingin digunakan:${NC}"
+    echo -e "\n${CYAN}Jalankan perintah berikut di Termux, lalu masuk menggunakan akun Google Drive yang dituju:${NC}"
     echo -e "  ${YELLOW}pkg update -y && pkg install rclone -y${NC}"
     echo -e "  ${YELLOW}rclone authorize \"drive\"${NC}"
     echo -e "\nTempel token JSON yang dihasilkan di sini:"
@@ -262,15 +223,30 @@ setup_oauth() {
     log INFO "Autentikasi OAuth berhasil."
 }
 
-# ─── NAMA NODE ───────────────────────────────────────────────
+# ─── MANAJEMEN NAMA NODE ──────────────────────────────────────
+manage_node_name() {
+    echo -e "\n${CYAN}${BOLD}═══════ PENGATURAN NAMA NODE SERVER ═══════${NC}"
+
+    local current="(belum dikonfigurasi)"
+    [ -f "$NODE_CONFIG" ] && current=$(cat "$NODE_CONFIG" 2>/dev/null || echo "(belum dikonfigurasi)")
+    echo -e "  Nama node saat ini : ${BOLD}${current}${NC}"
+    echo ""
+    read -rp "Masukkan nama node baru (contoh: SG-Node-01): " input
+
+    local sanitized
+    sanitized=$(echo "$input" | tr -cd '[:alnum:]_-')
+    [ -z "$sanitized" ] && { log ERROR "Nama node tidak valid. Hanya huruf, angka, tanda hubung, dan garis bawah yang diizinkan."; return 1; }
+
+    mkdir -p "$CONFIG_DIR"
+    echo "$sanitized" > "$NODE_CONFIG"
+    log INFO "Nama node berhasil disimpan: $sanitized"
+}
+
 get_node_name() {
     mkdir -p "$CONFIG_DIR"
     if [ ! -f "$NODE_CONFIG" ]; then
-        read -rp "Masukkan nama node (contoh: SG-Node-01): " input
-        local sanitized
-        sanitized=$(echo "$input" | tr -cd '[:alnum:]_-')
-        [ -z "$sanitized" ] && { log ERROR "Nama node tidak valid."; exit 1; }
-        echo "$sanitized" > "$NODE_CONFIG"
+        log WARN "Nama node belum dikonfigurasi. Silakan atur terlebih dahulu."
+        manage_node_name || exit 1
     fi
     cat "$NODE_CONFIG"
 }
@@ -289,7 +265,7 @@ check_disk_space() {
     exit 1
 }
 
-# ─── RCLONE DENGAN MEKANISME PERCOBAAN ULANG ─────────────────
+# ─── RCLONE DENGAN MEKANISME PERCOBAAN ULANG ──────────────────
 rclone_retry() {
     local op="$1"; shift
     local attempt=1
@@ -302,76 +278,59 @@ rclone_retry() {
             --low-level-retries=10 \
             --stats=30s \
             && return 0
-        log WARN "Percobaan $attempt/$MAX_RETRIES gagal — mencoba ulang dalam 15 detik..."
+        log WARN "Percobaan ke-${attempt}/${MAX_RETRIES} gagal — mencoba ulang dalam 15 detik..."
         sleep 15
         (( attempt++ )) || true
     done
-    log ERROR "Operasi gagal setelah $MAX_RETRIES percobaan."
+    log ERROR "Operasi gagal setelah $MAX_RETRIES kali percobaan."
     return 1
 }
 
-# ─── KOMPRESI CERDAS ─────────────────────────────────────────
+# ─── KOMPRESI CERDAS ──────────────────────────────────────────
 smart_compress() {
-    local src_dir="$1"
-    local src_name="$2"
-    local dest="$3"
-
-    local cpu_count
-    cpu_count=$(nproc 2>/dev/null || echo 1)
-
+    local src_dir="$1" src_name="$2" dest="$3"
+    local cpu_count; cpu_count=$(nproc 2>/dev/null || echo 1)
     local nice_prefix="nice -n 10"
-    if command -v ionice &>/dev/null; then
-        nice_prefix="ionice -c3 nice -n 10"
-    fi
+    command -v ionice &>/dev/null && nice_prefix="ionice -c3 nice -n 10"
 
     if command -v pigz &>/dev/null; then
-        local threads=$(( cpu_count / 2 ))
-        [ "$threads" -lt 1 ] && threads=1
+        local threads=$(( cpu_count / 2 )); [ "$threads" -lt 1 ] && threads=1
         log STEP "Kompresi paralel menggunakan pigz ($threads thread, prioritas rendah)..."
-        $nice_prefix tar \
-            --use-compress-program="pigz -p $threads" \
-            -f "$dest" \
-            --checkpoint=500 \
-            --checkpoint-action=dot \
+        $nice_prefix tar --use-compress-program="pigz -p $threads" \
+            -f "$dest" --checkpoint=500 --checkpoint-action=dot \
             -c -C "$src_dir" "$src_name" 2>/dev/null
     else
         log STEP "Kompresi menggunakan gzip standar (prioritas rendah)..."
-        $nice_prefix tar \
-            -czf "$dest" \
-            --checkpoint=500 \
-            --checkpoint-action=dot \
+        $nice_prefix tar -czf "$dest" \
+            --checkpoint=500 --checkpoint-action=dot \
             -C "$src_dir" "$src_name" 2>/dev/null
     fi
 }
 
-# ─── PROSES BACKUP ───────────────────────────────────────────
+# ─── PROSES BACKUP ────────────────────────────────────────────
 do_backup() {
     local node; node=$(get_node_name)
     local stamp; stamp=$(date +%Y-%m-%d_%H-%M-%S)
     local fname="${node}_${stamp}.tar.gz"
     local tmpf="$TEMP_DIR/$fname"
 
-    echo -e "\n${CYAN}${BOLD}═══════ MODE BACKUP ═══════${NC}"
-    log STEP "Node: $node | File target: $fname"
+    echo -e "\n${CYAN}${BOLD}═══════ PROSES BACKUP ═══════${NC}"
+    log STEP "Node: $node | Nama file: $fname"
 
     [ -d "$PTERO_PATH" ] || { log ERROR "Direktori tidak ditemukan: $PTERO_PATH"; exit 1; }
 
     mkdir -p "$TEMP_DIR"
     check_disk_space "$PTERO_PATH"
 
-    local remote_target
-    remote_target=$(get_remote_target)
+    local remote_target; remote_target=$(get_remote_target)
     log STEP "Tujuan remote: $remote_target"
 
     local wings_was_running=false
     if systemctl is-active --quiet wings 2>/dev/null; then
         log STEP "Menghentikan Wings sementara selama proses backup..."
-        if systemctl stop wings 2>/dev/null; then
-            wings_was_running=true
-            log INFO "Wings berhasil dihentikan."
-        else
-            log WARN "Gagal menghentikan Wings — proses backup tetap dilanjutkan."
-        fi
+        systemctl stop wings 2>/dev/null \
+            && wings_was_running=true && log INFO "Wings berhasil dihentikan." \
+            || log WARN "Gagal menghentikan Wings — proses backup tetap dilanjutkan."
     else
         log INFO "Wings tidak aktif — melanjutkan proses backup."
     fi
@@ -391,16 +350,10 @@ do_backup() {
 
     if $wings_was_running; then
         log STEP "Menjalankan kembali Wings..."
-        if systemctl start wings 2>/dev/null; then
-            sleep 3
-            if systemctl is-active --quiet wings 2>/dev/null; then
-                log INFO "Wings kembali berjalan."
-            else
-                log WARN "Wings gagal dijalankan — periksa dengan: systemctl status wings"
-            fi
-        else
-            log WARN "Gagal menjalankan Wings — jalankan secara manual: systemctl start wings"
-        fi
+        systemctl start wings 2>/dev/null && sleep 3
+        systemctl is-active --quiet wings 2>/dev/null \
+            && log INFO "Wings kembali berjalan." \
+            || log WARN "Wings gagal dijalankan — periksa dengan: systemctl status wings"
     fi
 
     log STEP "Menghapus backup yang lebih lama dari ${RETENTION_DAYS} hari..."
@@ -409,7 +362,7 @@ do_backup() {
         --include "${node}_*.tar.gz" 2>/dev/null || true
 
     echo -e "\n${GREEN}${BOLD}╔══════════════════════════════════════╗"
-    echo -e "║         ✅ BACKUP BERHASIL!           ║"
+    echo -e "║         ✅  BACKUP BERHASIL!          ║"
     echo -e "╠══════════════════════════════════════╣"
     echo -e "║${NC} Node  : ${BOLD}$node${NC}"
     echo -e "${GREEN}${BOLD}║${NC} File  : ${BOLD}$fname${NC}"
@@ -420,14 +373,12 @@ do_backup() {
     log INFO "BACKUP SELESAI: $fname ($fsize)"
 }
 
-# ─── PROSES RESTORE ──────────────────────────────────────────
+# ─── PROSES RESTORE ───────────────────────────────────────────
 do_restore() {
-    echo -e "\n${CYAN}${BOLD}═══════ MODE RESTORE ═══════${NC}"
+    echo -e "\n${CYAN}${BOLD}═══════ PROSES RESTORE ═══════${NC}"
     log STEP "Mengambil daftar backup dari Google Drive..."
 
-    local remote_target
-    remote_target=$(get_remote_target)
-
+    local remote_target; remote_target=$(get_remote_target)
     local list
     list=$(rclone lsf "$remote_target" --include "*.tar.gz" 2>/dev/null | sort -r) || true
 
@@ -443,7 +394,7 @@ do_restore() {
         local sz
         sz=$(rclone size "$remote_target/$f" --json 2>/dev/null \
             | python3 -c "import sys,json; d=json.load(sys.stdin); mb=d['bytes']//1024//1024; print(f'{mb}MB')" \
-            2>/dev/null || echo "?") || sz="?"
+            2>/dev/null || echo "?")
         echo -e "  ${BOLD}[$i]${NC} $f ${YELLOW}($sz)${NC}"
         (( i++ )) || true
     done <<< "$list"
@@ -457,14 +408,14 @@ do_restore() {
 
     local rfile="${files[$((num-1))]}"
 
-    echo -e "\n${RED}${BOLD}⚠️  PERINGATAN: TINDAKAN INI TIDAK DAPAT DIBATALKAN! ⚠️${NC}"
+    echo -e "\n${RED}${BOLD}⚠️   PERINGATAN: TINDAKAN INI TIDAK DAPAT DIBATALKAN! ⚠️${NC}"
     echo -e "${RED}  • Seluruh isi $PTERO_PATH akan dihapus.${NC}"
     echo -e "${YELLOW}  • File   : $rfile${NC}"
     echo -e "${YELLOW}  • Data lama akan dipindahkan ke /root/volumes_snapshot_*${NC}"
     echo ""
     read -rp "Ketik ${BOLD}RESTORE${NC} untuk melanjutkan: " confirm
 
-    [ "$confirm" == "RESTORE" ] || { log WARN "Proses restore dibatalkan."; exit 0; }
+    [ "$confirm" == "RESTORE" ] || { log WARN "Proses restore dibatalkan oleh pengguna."; exit 0; }
 
     mkdir -p "$TEMP_DIR"
     local local_file="$TEMP_DIR/$rfile"
@@ -476,7 +427,7 @@ do_restore() {
     log STEP "Memverifikasi integritas arsip..."
     tar -tzf "$local_file" >/dev/null 2>&1 \
         || { log ERROR "File backup rusak atau tidak dapat dibaca."; rm -f "$local_file"; exit 1; }
-    log INFO "Arsip valid."
+    log INFO "Integritas arsip terverifikasi."
 
     local wings_up=false
     if systemctl is-active --quiet wings 2>/dev/null; then
@@ -491,7 +442,7 @@ do_restore() {
     fi
     mkdir -p "$PTERO_PATH"
 
-    log STEP "Mengekstrak backup..."
+    log STEP "Mengekstrak arsip backup..."
     tar -xzf "$local_file" \
         --checkpoint=500 \
         --checkpoint-action=dot \
@@ -500,8 +451,7 @@ do_restore() {
     log INFO "Ekstraksi selesai."
 
     log STEP "Memperbaiki izin akses direktori..."
-    local ptero_uid
-    ptero_uid=$(id -u pterodactyl 2>/dev/null || echo "988")
+    local ptero_uid; ptero_uid=$(id -u pterodactyl 2>/dev/null || echo "988")
     chown -R "${ptero_uid}:${ptero_uid}" "$PTERO_PATH" 2>/dev/null || true
     chmod -R 755 "$PTERO_PATH" 2>/dev/null || true
 
@@ -516,7 +466,7 @@ do_restore() {
     rm -f "$local_file"
 
     echo -e "\n${GREEN}${BOLD}╔══════════════════════════════════════╗"
-    echo -e "║         ✅ RESTORE BERHASIL!          ║"
+    echo -e "║         ✅  RESTORE BERHASIL!         ║"
     echo -e "╠══════════════════════════════════════╣"
     echo -e "║${NC} File     : ${BOLD}$rfile${NC}"
     echo -e "${GREEN}${BOLD}║${NC} Snapshot : ${BOLD}$snap${NC}"
@@ -525,53 +475,110 @@ do_restore() {
     log INFO "RESTORE SELESAI: $rfile"
 }
 
-# ─── PENJADWALAN OTOMATIS (CRON) ─────────────────────────────
+# ─── PENJADWALAN OTOMATIS (CRON) DENGAN KONVERSI TIMEZONE ─────
 setup_cron() {
     echo -e "\n${CYAN}${BOLD}═══════ JADWAL BACKUP OTOMATIS ═══════${NC}"
-    echo -e "  ${BOLD}1.${NC} Setiap 6 jam"
-    echo -e "  ${BOLD}2.${NC} Setiap 12 jam"
-    echo -e "  ${BOLD}3.${NC} Setiap hari pukul 02:00"
-    echo -e "  ${BOLD}4.${NC} Setiap hari pukul 00:00 & 12:00"
-    echo -e "  ${BOLD}5.${NC} Ekspresi cron kustom"
-    echo -e "  ${BOLD}6.${NC} ❌ Hapus jadwal yang ada"
+
+    local server_tz
+    server_tz=$(timedatectl show --property=Timezone --value 2>/dev/null \
+        || cat /etc/timezone 2>/dev/null \
+        || echo "UTC")
+
+    echo -e "  Zona waktu server saat ini : ${BOLD}${server_tz}${NC}"
     echo ""
-    read -rp "Pilihan (1-6): " choice
 
-    local script_path="/usr/local/bin/bimxyz"
-    local cron_cmd="bash $script_path --auto-backup >> $LOG_FILE 2>&1"
+    local interval_days
+    while true; do
+        read -rp "Backup setiap berapa hari sekali? (contoh: 1): " interval_days
+        [[ "$interval_days" =~ ^[1-9][0-9]*$ ]] && break
+        log WARN "Masukan tidak valid. Masukkan angka bulat positif."
+    done
 
-    crontab -l 2>/dev/null | grep -v "$script_path" | crontab - 2>/dev/null || true
+    local wib_time
+    while true; do
+        read -rp "Jam berapa backup dieksekusi? (Format HH:MM, Zona Waktu WIB): " wib_time
+        [[ "$wib_time" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] && break
+        log WARN "Format waktu tidak valid. Gunakan format HH:MM (contoh: 02:00)."
+    done
 
-    [ "$choice" == "6" ] && { log INFO "Jadwal backup otomatis berhasil dihapus."; return 0; }
+    local wib_hour wib_min
+    wib_hour=$(echo "$wib_time" | cut -d: -f1 | sed 's/^0//')
+    wib_min=$(echo "$wib_time"  | cut -d: -f2 | sed 's/^0//')
 
-    local expr
-    case "$choice" in
-        1) expr="0 */6 * * *" ;;
-        2) expr="0 */12 * * *" ;;
-        3) expr="0 2 * * *" ;;
-        4) expr="0 0,12 * * *" ;;
-        5) read -rp "Masukkan ekspresi cron: " expr ;;
-        *) log ERROR "Pilihan tidak valid."; return 1 ;;
-    esac
+    local cron_hour cron_min
+    if [ "$server_tz" == "Asia/Jakarta" ] || [ "$server_tz" == "WIB" ]; then
+        cron_hour=$wib_hour
+        cron_min=$wib_min
+        log INFO "Server sudah berada di zona waktu WIB — tidak diperlukan konversi."
+    else
+        log STEP "Server berada di zona waktu '$server_tz' — mengonversi waktu WIB ke zona waktu server..."
 
+        local offset_seconds
+        offset_seconds=$(python3 -c "
+import datetime, zoneinfo, sys
+try:
+    tz = zoneinfo.ZoneInfo('$server_tz')
+    now = datetime.datetime.now(tz)
+    offset_wib = 7 * 3600
+    server_offset = int(now.utcoffset().total_seconds())
+    print(server_offset - offset_wib)
+except Exception as e:
+    sys.exit(1)
+" 2>/dev/null) || {
+            log WARN "Konversi timezone otomatis gagal — menggunakan waktu WIB secara langsung sebagai fallback."
+            offset_seconds=0
+        }
+
+        local wib_total_min=$(( wib_hour * 60 + wib_min ))
+        local offset_min=$(( offset_seconds / 60 ))
+        local server_total_min=$(( (wib_total_min + offset_min + 1440) % 1440 ))
+
+        cron_hour=$(( server_total_min / 60 ))
+        cron_min=$(( server_total_min % 60 ))
+
+        log INFO "Waktu WIB ${wib_time} dikonversi menjadi pukul $(printf '%02d:%02d' "$cron_hour" "$cron_min") waktu server ($server_tz)."
+    fi
+
+    local cron_day_field="*"
+    [ "$interval_days" -gt 1 ] && cron_day_field="*/${interval_days}"
+
+    local expr="${cron_min} ${cron_hour} ${cron_day_field} * *"
+    local cron_cmd="bash $SCRIPT_PATH --auto-backup >> $LOG_FILE 2>&1"
+
+    crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab - 2>/dev/null || true
     ( crontab -l 2>/dev/null; echo "$expr $cron_cmd" ) | crontab -
-    log INFO "Jadwal backup otomatis aktif: [$expr]"
-    echo -e "${GREEN}Verifikasi jadwal dengan perintah: ${YELLOW}crontab -l${NC}"
+
+    echo ""
+    log INFO "Jadwal backup otomatis berhasil dikonfigurasi."
+    echo -e "  ${BOLD}Ekspresi Cron${NC}  : ${YELLOW}$expr${NC}"
+    echo -e "  ${BOLD}Waktu Eksekusi${NC} : Setiap $interval_days hari, pukul $(printf '%02d:%02d' "$cron_hour" "$cron_min") waktu server ($server_tz)"
+    echo -e "  ${BOLD}Verifikasi${NC}     : ${CYAN}crontab -l${NC}"
+    echo ""
+
+    echo -e "  ${BOLD}6.${NC} ❌ Hapus jadwal yang ada"
+    read -rp "Ketik '6' untuk menghapus jadwal yang ada, atau tekan Enter untuk kembali: " opt
+    if [ "${opt:-}" == "6" ]; then
+        crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab - 2>/dev/null || true
+        log INFO "Jadwal backup otomatis berhasil dihapus."
+    fi
 }
 
-# ─── DASBOR STATUS SISTEM ────────────────────────────────────
+# ─── DASBOR STATUS SISTEM ─────────────────────────────────────
 show_status() {
     echo -e "\n${CYAN}${BOLD}═══════ STATUS SISTEM ═══════${NC}"
 
     local node="(belum dikonfigurasi)"
     [ -f "$NODE_CONFIG" ] && node=$(cat "$NODE_CONFIG" 2>/dev/null || echo "(belum dikonfigurasi)")
-    echo -e "  Node         : ${BOLD}$node${NC}"
+    echo -e "  Node Server  : ${BOLD}$node${NC}"
+
+    local server_tz
+    server_tz=$(timedatectl show --property=Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo "Tidak diketahui")
+    echo -e "  Zona Waktu   : ${BOLD}$server_tz${NC}"
 
     {
         if gdrive_is_alive 2>/dev/null; then
             local remote_target; remote_target=$(get_remote_target 2>/dev/null || echo "$REMOTE_NAME:$GDRIVE_FOLDER")
-            local count
-            count=$(rclone lsf "$remote_target" --include "*.tar.gz" 2>/dev/null | wc -l) || count="?"
+            local count; count=$(rclone lsf "$remote_target" --include "*.tar.gz" 2>/dev/null | wc -l) || count="?"
             echo -e "  Google Drive : ${GREEN}${BOLD}TERHUBUNG ✓${NC} ($count backup tersedia)"
         else
             echo -e "  Google Drive : ${RED}${BOLD}TIDAK TERHUBUNG ✗${NC}"
@@ -580,28 +587,25 @@ show_status() {
 
     {
         local disk
-        disk=$(df -h "$PTERO_PATH" 2>/dev/null | awk 'NR==2{printf "%s terpakai / %s total (%s)", $3,$2,$5}') \
-            || disk="(tidak dapat dibaca)"
+        disk=$(df -h "$PTERO_PATH" 2>/dev/null | awk 'NR==2{printf "%s terpakai / %s total (%s)", $3,$2,$5}') || disk="(tidak dapat dibaca)"
         echo -e "  Disk         : ${BOLD}$disk${NC}"
     } || echo -e "  Disk         : ${YELLOW}${BOLD}PEMERIKSAAN GAGAL${NC}"
 
     {
-        if systemctl is-active --quiet wings 2>/dev/null; then
-            echo -e "  Wings        : ${GREEN}${BOLD}BERJALAN ✓${NC}"
-        else
-            echo -e "  Wings        : ${RED}${BOLD}BERHENTI${NC}"
-        fi
+        systemctl is-active --quiet wings 2>/dev/null \
+            && echo -e "  Wings        : ${GREEN}${BOLD}BERJALAN ✓${NC}" \
+            || echo -e "  Wings        : ${RED}${BOLD}BERHENTI${NC}"
     } || echo -e "  Wings        : ${YELLOW}${BOLD}PEMERIKSAAN GAGAL${NC}"
 
     {
         local cron_entry
-        cron_entry=$(crontab -l 2>/dev/null | grep "/usr/local/bin/bimxyz" || true)
+        cron_entry=$(crontab -l 2>/dev/null | grep "$SCRIPT_PATH" || true)
         if [ -n "$cron_entry" ]; then
-            echo -e "  Backup Otomatis: ${GREEN}${BOLD}AKTIF${NC} → $cron_entry"
+            echo -e "  Backup Otomatis : ${GREEN}${BOLD}AKTIF${NC} → $cron_entry"
         else
-            echo -e "  Backup Otomatis: ${YELLOW}${BOLD}TIDAK AKTIF${NC}"
+            echo -e "  Backup Otomatis : ${YELLOW}${BOLD}TIDAK AKTIF${NC}"
         fi
-    } || echo -e "  Backup Otomatis: ${YELLOW}${BOLD}PEMERIKSAAN GAGAL${NC}"
+    } || echo -e "  Backup Otomatis : ${YELLOW}${BOLD}PEMERIKSAAN GAGAL${NC}"
 
     {
         local last
@@ -612,14 +616,14 @@ show_status() {
     echo ""
 }
 
-# ─── BANNER ──────────────────────────────────────────────────
+# ─── BANNER ───────────────────────────────────────────────────
 show_banner() {
     clear
     echo -e "${CYAN}${BOLD}"
-    echo -e "╔═════════════════════════════════════════════════╗"
-    echo -e "║    👑 BIMXYZ ULTIMATE BACKUP SYSTEM V${VERSION}  ║"
-    echo -e "║       Production Grade | Multi-Server Deploy     ║"
-    echo -e "╚═════════════════════════════════════════════════╝${NC}"
+    echo -e "╔══════════════════════════════════════════════════╗"
+    echo -e "║   👑  BIMXYZ ULTIMATE BACKUP SYSTEM V${VERSION}       ║"
+    echo -e "║        Enterprise Grade | Multi-Server Deploy     ║"
+    echo -e "╚══════════════════════════════════════════════════╝${NC}"
     echo -e "  ${YELLOW}Log: $LOG_FILE${NC}\n"
 }
 
@@ -628,30 +632,31 @@ show_menu() {
     echo -e "\n${CYAN}${BOLD}MENU UTAMA:${NC}"
     echo -e "  ${BOLD}1.${NC} 🚀 Jalankan Backup Sekarang"
     echo -e "  ${BOLD}2.${NC} 📥 Pulihkan Backup (Restore)"
-    echo -e "  ${BOLD}3.${NC} ⏰ Atur Backup Otomatis"
-    echo -e "  ${BOLD}4.${NC} 📊 Lihat Status Sistem"
-    echo -e "  ${BOLD}5.${NC} 🔄 Reset Autentikasi Google Drive"
-    echo -e "  ${BOLD}6.${NC} 🚪 Keluar"
+    echo -e "  ${BOLD}3.${NC} ⏰ Atur Jadwal Backup Otomatis"
+    echo -e "  ${BOLD}4.${NC} 🖥️  Atur / Ubah Nama Node Server"
+    echo -e "  ${BOLD}5.${NC} 📊 Lihat Status Sistem"
+    echo -e "  ${BOLD}6.${NC} 🔄 Reset Autentikasi Google Drive"
+    echo -e "  ${BOLD}7.${NC} 🚪 Keluar"
     echo ""
-    read -rp "Pilihan (1-6): " choice
+    read -rp "Pilihan (1-7): " choice
 
     case "$choice" in
         1) do_backup ;;
         2) do_restore ;;
         3) setup_cron ;;
-        4) show_status ;;
-        5)
+        4) manage_node_name ;;
+        5) show_status ;;
+        6)
             rclone config delete "$REMOTE_NAME" 2>/dev/null || true
-            rm -f "$CONFIG_DIR/service_account.json"
-            rm -f "$FOLDER_ID_CACHE"
+            rm -f "$CONFIG_DIR/service_account.json" "$FOLDER_ID_CACHE"
             log INFO "Autentikasi berhasil direset. Jalankan skrip kembali untuk mengonfigurasi ulang."
             ;;
-        6) exit 0 ;;
+        7) exit 0 ;;
         *) log ERROR "Pilihan tidak valid." ;;
     esac
 }
 
-# ─── TITIK MASUK UTAMA ───────────────────────────────────────
+# ─── TITIK MASUK UTAMA ────────────────────────────────────────
 main() {
     check_root
     mkdir -p "$CONFIG_DIR"
