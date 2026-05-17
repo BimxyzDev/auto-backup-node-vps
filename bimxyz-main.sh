@@ -31,12 +31,13 @@ log() {
     local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
     echo "[$ts] [$level] $msg" >> "$LOG_FILE"
     case "$level" in
-        INFO)  echo -e "${GREEN}[✓] $msg${NC}" ;;
-        WARN)  echo -e "${YELLOW}[!] $msg${NC}" ;;
-        ERROR) echo -e "${RED}[✗] $msg${NC}" ;;
-        STEP)  echo -e "${CYAN}[»] $msg${NC}" ;;
+        INFO)  echo -e "${GREEN}[✓] $msg${NC}" >&2 ;;
+        WARN)  echo -e "${YELLOW}[!] $msg${NC}" >&2 ;;
+        ERROR) echo -e "${RED}[✗] $msg${NC}" >&2 ;;
+        STEP)  echo -e "${CYAN}[»] $msg${NC}" >&2 ;;
     esac
 }
+
 
 # ─── PEMBERSIHAN ──────────────────────────────────────────────
 cleanup() {
