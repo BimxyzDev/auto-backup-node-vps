@@ -25,6 +25,9 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'
 YELLOW='\033[1;33m'; BOLD='\033[1m'; NC='\033[0m'
 
 # ─── LOGGING ──────────────────────────────────────────────────
+# FIX #2: Semua echo -e dekoratif dialihkan ke stderr (>&2)
+# sehingga tidak merusak command substitution seperti:
+#   folder_id=$(resolve_gdrive_folder_id)
 log() {
     local level="$1"; shift
     local msg="$*"
@@ -308,14 +311,14 @@ smart_compress() {
     fi
 }
 
-# ─── PROSES BACKUP ────────────────────────────────────────────
-do_backup() {
+# ─── LOGIKA INTI BACKUP (dijalankan di background) ────────────
+_backup_worker() {
     local node; node=$(get_node_name)
     local stamp; stamp=$(date +%Y-%m-%d_%H-%M-%S)
     local fname="${node}_${stamp}.tar.gz"
     local tmpf="$TEMP_DIR/$fname"
 
-    echo -e "\n${CYAN}${BOLD}═══════ PROSES BACKUP ═══════${NC}"
+    log STEP "=== BACKUP WORKER DIMULAI (PID: $$) ==="
     log STEP "Node: $node | Nama file: $fname"
 
     [ -d "$PTERO_PATH" ] || { log ERROR "Direktori tidak ditemukan: $PTERO_PATH"; exit 1; }
@@ -338,7 +341,7 @@ do_backup() {
 
     local t0=$SECONDS
     smart_compress "/var/lib/pterodactyl" "volumes" "$tmpf"
-    echo ""
+    echo "" >> "$LOG_FILE"
     local elapsed=$(( SECONDS - t0 ))
     local fsize; fsize=$(du -sh "$tmpf" | awk '{print $1}')
     log INFO "Kompresi selesai: ${fsize} dalam ${elapsed} detik."
@@ -362,19 +365,124 @@ do_backup() {
         --min-age "${RETENTION_DAYS}d" \
         --include "${node}_*.tar.gz" 2>/dev/null || true
 
-    echo -e "\n${GREEN}${BOLD}╔══════════════════════════════════════╗"
-    echo -e "║         ✅  BACKUP BERHASIL!          ║"
-    echo -e "╠══════════════════════════════════════╣"
-    echo -e "║${NC} Node  : ${BOLD}$node${NC}"
-    echo -e "${GREEN}${BOLD}║${NC} File  : ${BOLD}$fname${NC}"
-    echo -e "${GREEN}${BOLD}║${NC} Ukuran: ${BOLD}$fsize${NC}"
-    echo -e "${GREEN}${BOLD}║${NC} Drive : ${BOLD}$remote_target${NC}"
-    echo -e "${GREEN}${BOLD}╚══════════════════════════════════════╝${NC}"
-
+    log INFO "========================================"
+    log INFO "  ✅  BACKUP BERHASIL!"
+    log INFO "  Node  : $node"
+    log INFO "  File  : $fname"
+    log INFO "  Ukuran: $fsize"
+    log INFO "  Drive : $remote_target"
+    log INFO "========================================"
     log INFO "BACKUP SELESAI: $fname ($fsize)"
 }
 
-# ─── PROSES RESTORE ───────────────────────────────────────────
+# ─── PROSES BACKUP (dengan SIGHUP-proof background execution) ─
+# FIX #1: Operasi berat dilempar ke background via nohup + subshell,
+# layar foreground otomatis menjalankan `tail -f` untuk memantau log.
+# Ctrl+C atau putusnya SSH hanya mematikan tail, bukan worker.
+do_backup() {
+    echo -e "\n${CYAN}${BOLD}═══════ PROSES BACKUP ═══════${NC}"
+    echo -e "${YELLOW}[»] Proses backup dijalankan di background (kebal SIGHUP).${NC}"
+    echo -e "${YELLOW}[»] Pantau progress melalui log di bawah ini.${NC}"
+    echo -e "${YELLOW}[»] Tekan Ctrl+C kapan saja untuk berhenti memantau —${NC}"
+    echo -e "${YELLOW}    proses backup TETAP berjalan di background.${NC}\n"
+
+    # Jalankan worker di background, kebal SIGHUP, stdout+stderr masuk ke log
+    nohup bash -c "
+        source '$SCRIPT_PATH'
+        _backup_worker
+    " >> "$LOG_FILE" 2>&1 &
+    local bg_pid=$!
+    disown "$bg_pid"
+
+    echo -e "${GREEN}[✓] Worker backup berjalan (PID: ${bg_pid}).${NC}"
+    echo -e "${CYAN}[»] Menampilkan log secara langsung (Ctrl+C untuk berhenti memantau)...${NC}\n"
+
+    # Tail log hingga kata kunci selesai terdeteksi atau pengguna Ctrl+C
+    # Menggunakan subshell agar trap INT hanya mematikan tail, bukan skrip utama
+    (
+        trap 'exit 0' INT
+        tail -f "$LOG_FILE" --pid="$bg_pid" 2>/dev/null \
+            || tail -f "$LOG_FILE"
+    ) &
+    local tail_pid=$!
+
+    # Tunggu worker selesai, lalu hentikan tail
+    wait "$bg_pid" 2>/dev/null || true
+    kill "$tail_pid" 2>/dev/null || true
+    wait "$tail_pid" 2>/dev/null || true
+
+    echo -e "\n${GREEN}${BOLD}[✓] Proses backup telah selesai. Cek log untuk detail: $LOG_FILE${NC}"
+}
+
+# ─── LOGIKA INTI RESTORE (dijalankan di background) ───────────
+_restore_worker() {
+    local rfile="$1"
+    local remote_target="$2"
+
+    log STEP "=== RESTORE WORKER DIMULAI (PID: $$) ==="
+
+    mkdir -p "$TEMP_DIR"
+    local local_file="$TEMP_DIR/$rfile"
+
+    log STEP "Mengunduh file: $rfile"
+    rclone_retry copy "$remote_target/$rfile" "$TEMP_DIR/" \
+        || { log ERROR "Pengunduhan gagal."; exit 1; }
+
+    log STEP "Memverifikasi integritas arsip..."
+    tar -tzf "$local_file" >/dev/null 2>&1 \
+        || { log ERROR "File backup rusak atau tidak dapat dibaca."; rm -f "$local_file"; exit 1; }
+    log INFO "Integritas arsip terverifikasi."
+
+    local wings_up=false
+    if systemctl is-active --quiet wings 2>/dev/null; then
+        log STEP "Menghentikan Wings..."
+        systemctl stop wings && wings_up=true
+    fi
+
+    local snap="/root/volumes_snapshot_$(date +%H%M%S)"
+    if [ -d "$PTERO_PATH" ] && [ "$(ls -A "$PTERO_PATH" 2>/dev/null)" ]; then
+        log STEP "Memindahkan data lama ke: $snap"
+        mv "$PTERO_PATH" "$snap" 2>/dev/null || true
+    fi
+    mkdir -p "$PTERO_PATH"
+
+    log STEP "Mengekstrak arsip backup..."
+    tar -xzf "$local_file" \
+        --checkpoint=500 \
+        --checkpoint-action=dot \
+        -C /var/lib/pterodactyl 2>/dev/null
+    echo "" >> "$LOG_FILE"
+    log INFO "Ekstraksi selesai."
+
+    log STEP "Memperbaiki izin akses direktori..."
+    local ptero_uid; ptero_uid=$(id -u pterodactyl 2>/dev/null || echo "988")
+    chown -R "${ptero_uid}:${ptero_uid}" "$PTERO_PATH" 2>/dev/null || true
+    chmod -R 755 "$PTERO_PATH" 2>/dev/null || true
+
+    if $wings_up; then
+        log STEP "Menjalankan kembali Wings..."
+        systemctl start wings && sleep 3
+        systemctl is-active --quiet wings \
+            && log INFO "Wings kembali berjalan." \
+            || log WARN "Wings gagal dijalankan — periksa dengan: systemctl status wings"
+    fi
+
+    rm -f "$local_file"
+
+    log INFO "========================================"
+    log INFO "  ✅  RESTORE BERHASIL!"
+    log INFO "  File     : $rfile"
+    log INFO "  Snapshot : $snap"
+    log INFO "========================================"
+    log INFO "RESTORE SELESAI: $rfile"
+}
+
+# ─── PROSES RESTORE (dengan SIGHUP-proof background execution) ─
+# FIX #1: Sama seperti do_backup — bagian interaktif (pilih file,
+# konfirmasi) tetap di foreground. Setelah konfirmasi, worker
+# dikirim ke background dan layar menampilkan tail -f log.
+# FIX #3: Prompt konfirmasi menggunakan echo -en + read -r terpisah
+# agar kode ANSI tidak muncul sebagai teks mentah di Termux/klien SSH.
 do_restore() {
     echo -e "\n${CYAN}${BOLD}═══════ PROSES RESTORE ═══════${NC}"
     log STEP "Mengambil daftar backup dari Google Drive..."
@@ -414,66 +522,44 @@ do_restore() {
     echo -e "${YELLOW}  • File   : $rfile${NC}"
     echo -e "${YELLOW}  • Data lama akan dipindahkan ke /root/volumes_snapshot_*${NC}"
     echo ""
-    read -rp "Ketik ${BOLD}RESTORE${NC} untuk melanjutkan: " confirm
+
+    # FIX #3: Pisahkan echo prompt dan read agar ANSI color
+    # tidak muncul sebagai karakter mentah di Termux / klien SSH tertentu
+    echo -en "Ketik ${BOLD}RESTORE${NC} untuk melanjutkan: "
+    read -r confirm
 
     [ "$confirm" == "RESTORE" ] || { log WARN "Proses restore dibatalkan oleh pengguna."; exit 0; }
 
-    mkdir -p "$TEMP_DIR"
-    local local_file="$TEMP_DIR/$rfile"
+    echo -e "${YELLOW}[»] Proses restore dijalankan di background (kebal SIGHUP).${NC}"
+    echo -e "${YELLOW}[»] Tekan Ctrl+C kapan saja untuk berhenti memantau —${NC}"
+    echo -e "${YELLOW}    proses restore TETAP berjalan di background.${NC}\n"
 
-    log STEP "Mengunduh file: $rfile"
-    rclone_retry copy "$remote_target/$rfile" "$TEMP_DIR/" \
-        || { log ERROR "Pengunduhan gagal."; exit 1; }
+    # Ekspor variabel yang dibutuhkan worker, lalu lempar ke background
+    local escaped_rfile; escaped_rfile=$(printf '%q' "$rfile")
+    local escaped_target; escaped_target=$(printf '%q' "$remote_target")
 
-    log STEP "Memverifikasi integritas arsip..."
-    tar -tzf "$local_file" >/dev/null 2>&1 \
-        || { log ERROR "File backup rusak atau tidak dapat dibaca."; rm -f "$local_file"; exit 1; }
-    log INFO "Integritas arsip terverifikasi."
+    nohup bash -c "
+        source '$SCRIPT_PATH'
+        _restore_worker $escaped_rfile $escaped_target
+    " >> "$LOG_FILE" 2>&1 &
+    local bg_pid=$!
+    disown "$bg_pid"
 
-    local wings_up=false
-    if systemctl is-active --quiet wings 2>/dev/null; then
-        log STEP "Menghentikan Wings..."
-        systemctl stop wings && wings_up=true
-    fi
+    echo -e "${GREEN}[✓] Worker restore berjalan (PID: ${bg_pid}).${NC}"
+    echo -e "${CYAN}[»] Menampilkan log secara langsung (Ctrl+C untuk berhenti memantau)...${NC}\n"
 
-    local snap="/root/volumes_snapshot_$(date +%H%M%S)"
-    if [ -d "$PTERO_PATH" ] && [ "$(ls -A "$PTERO_PATH" 2>/dev/null)" ]; then
-        log STEP "Memindahkan data lama ke: $snap"
-        mv "$PTERO_PATH" "$snap" 2>/dev/null || true
-    fi
-    mkdir -p "$PTERO_PATH"
+    (
+        trap 'exit 0' INT
+        tail -f "$LOG_FILE" --pid="$bg_pid" 2>/dev/null \
+            || tail -f "$LOG_FILE"
+    ) &
+    local tail_pid=$!
 
-    log STEP "Mengekstrak arsip backup..."
-    tar -xzf "$local_file" \
-        --checkpoint=500 \
-        --checkpoint-action=dot \
-        -C /var/lib/pterodactyl 2>/dev/null
-    echo ""
-    log INFO "Ekstraksi selesai."
+    wait "$bg_pid" 2>/dev/null || true
+    kill "$tail_pid" 2>/dev/null || true
+    wait "$tail_pid" 2>/dev/null || true
 
-    log STEP "Memperbaiki izin akses direktori..."
-    local ptero_uid; ptero_uid=$(id -u pterodactyl 2>/dev/null || echo "988")
-    chown -R "${ptero_uid}:${ptero_uid}" "$PTERO_PATH" 2>/dev/null || true
-    chmod -R 755 "$PTERO_PATH" 2>/dev/null || true
-
-    if $wings_up; then
-        log STEP "Menjalankan kembali Wings..."
-        systemctl start wings && sleep 3
-        systemctl is-active --quiet wings \
-            && log INFO "Wings kembali berjalan." \
-            || log WARN "Wings gagal dijalankan — periksa dengan: systemctl status wings"
-    fi
-
-    rm -f "$local_file"
-
-    echo -e "\n${GREEN}${BOLD}╔══════════════════════════════════════╗"
-    echo -e "║         ✅  RESTORE BERHASIL!         ║"
-    echo -e "╠══════════════════════════════════════╣"
-    echo -e "║${NC} File     : ${BOLD}$rfile${NC}"
-    echo -e "${GREEN}${BOLD}║${NC} Snapshot : ${BOLD}$snap${NC}"
-    echo -e "${GREEN}${BOLD}╚══════════════════════════════════════╝${NC}"
-
-    log INFO "RESTORE SELESAI: $rfile"
+    echo -e "\n${GREEN}${BOLD}[✓] Proses restore telah selesai. Cek log untuk detail: $LOG_FILE${NC}"
 }
 
 # ─── PENJADWALAN OTOMATIS (CRON) DENGAN KONVERSI TIMEZONE ─────
@@ -608,6 +694,18 @@ show_status() {
         fi
     } || echo -e "  Backup Otomatis : ${YELLOW}${BOLD}PEMERIKSAAN GAGAL${NC}"
 
+    # --- INDIKATOR PROSES BACKGROUND ---
+    {
+        if pgrep -f "_backup_worker" >/dev/null; then
+            echo -e "  Aktivitas Saat Ini: ${YELLOW}${BOLD}⏳ BACKUP SEDANG BERJALAN...${NC}"
+        elif pgrep -f "_restore_worker" >/dev/null; then
+            echo -e "  Aktivitas Saat Ini: ${YELLOW}${BOLD}⏳ RESTORE SEDANG BERJALAN...${NC}"
+        else
+            echo -e "  Aktivitas Saat Ini: ${GREEN}${BOLD}IDLE (Standby)${NC}"
+        fi
+    }
+    # -----------------------------------
+
     {
         local last
         last=$(grep "BACKUP SELESAI\|RESTORE SELESAI" "$LOG_FILE" 2>/dev/null | tail -1 || true)
@@ -616,6 +714,7 @@ show_status() {
 
     echo ""
 }
+
 
 # ─── BANNER ───────────────────────────────────────────────────
 show_banner() {
@@ -671,11 +770,17 @@ main() {
         exit 0
     fi
 
-    show_banner
-    show_status
     install_deps
     setup_gdrive
-    show_menu
+
+    while true; do
+        show_banner
+        show_status
+        show_menu
+        
+        echo -e "\n${CYAN}──────────────────────────────────────────────${NC}"
+        read -rp "Tekan [ENTER] untuk kembali ke Menu Utama..."
+    done
 }
 
 main "$@"
