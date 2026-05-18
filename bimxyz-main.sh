@@ -6,6 +6,9 @@
 
 set -uo pipefail
 
+# FIX: Deklarasikan PATH agar dikenali oleh Cron saat Auto-Backup
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
 # ─── KONSTANTA ────────────────────────────────────────────────
 readonly VERSION="5.0"
 readonly REMOTE_NAME="gdrive_bimxyz"
@@ -16,7 +19,8 @@ readonly TEMP_DIR="/root/.bimxyz_temp"
 readonly NODE_CONFIG="$CONFIG_DIR/node.conf"
 readonly FOLDER_ID_CACHE="$CONFIG_DIR/gdrive_folder_id.cache"
 readonly LOG_FILE="/var/log/bimxyz_backup.log"
-readonly SCRIPT_PATH="/usr/local/bin/bimxyz"
+# FIX #3: Path dinamis — tidak lagi hardcode
+readonly SCRIPT_PATH="$(readlink -f "$0")"
 readonly MAX_RETRIES=3
 readonly RETENTION_DAYS=7
 
@@ -376,9 +380,10 @@ _backup_worker() {
 }
 
 # ─── PROSES BACKUP (dengan SIGHUP-proof background execution) ─
-# FIX #1: Operasi berat dilempar ke background via nohup + subshell,
-# layar foreground otomatis menjalankan `tail -f` untuk memantau log.
-# Ctrl+C atau putusnya SSH hanya mematikan tail, bukan worker.
+# FIX #1: Worker dipanggil via argumen eksplisit (bukan source),
+# sehingga tidak memicu loop menu utama.
+# FIX #2: trap INT dimatikan sebelum tail -f foreground agar
+# Ctrl+C tidak memanggil cleanup dan menghapus TEMP_DIR.
 do_backup() {
     echo -e "\n${CYAN}${BOLD}═══════ PROSES BACKUP ═══════${NC}"
     echo -e "${YELLOW}[»] Proses backup dijalankan di background (kebal SIGHUP).${NC}"
@@ -386,30 +391,20 @@ do_backup() {
     echo -e "${YELLOW}[»] Tekan Ctrl+C kapan saja untuk berhenti memantau —${NC}"
     echo -e "${YELLOW}    proses backup TETAP berjalan di background.${NC}\n"
 
-    # Jalankan worker di background, kebal SIGHUP, stdout+stderr masuk ke log
-    nohup bash -c "
-        source '$SCRIPT_PATH'
-        _backup_worker
-    " >> "$LOG_FILE" 2>&1 &
+    # FIX #1: Gunakan argumen eksplisit, bukan source
+    nohup bash "$SCRIPT_PATH" --run-worker-backup >> "$LOG_FILE" 2>&1 &
     local bg_pid=$!
     disown "$bg_pid"
 
     echo -e "${GREEN}[✓] Worker backup berjalan (PID: ${bg_pid}).${NC}"
     echo -e "${CYAN}[»] Menampilkan log secara langsung (Ctrl+C untuk berhenti memantau)...${NC}\n"
 
-    # Tail log hingga kata kunci selesai terdeteksi atau pengguna Ctrl+C
-    # Menggunakan subshell agar trap INT hanya mematikan tail, bukan skrip utama
-    (
-        trap 'exit 0' INT
-        tail -f "$LOG_FILE" --pid="$bg_pid" 2>/dev/null \
-            || tail -f "$LOG_FILE"
-    ) &
-    local tail_pid=$!
-
-    # Tunggu worker selesai, lalu hentikan tail
-    wait "$bg_pid" 2>/dev/null || true
-    kill "$tail_pid" 2>/dev/null || true
-    wait "$tail_pid" 2>/dev/null || true
+    # FIX #2: Matikan trap INT sebelum tail foreground agar
+    # Ctrl+C hanya menghentikan tail, bukan memanggil cleanup
+    trap - INT
+    tail -f "$LOG_FILE" --pid="$bg_pid" 2>/dev/null \
+        || tail -f "$LOG_FILE"
+    trap 'log ERROR "Proses dibatalkan oleh pengguna."; exit 130' INT TERM
 
     echo -e "\n${GREEN}${BOLD}[✓] Proses backup telah selesai. Cek log untuk detail: $LOG_FILE${NC}"
 }
@@ -478,11 +473,10 @@ _restore_worker() {
 }
 
 # ─── PROSES RESTORE (dengan SIGHUP-proof background execution) ─
-# FIX #1: Sama seperti do_backup — bagian interaktif (pilih file,
-# konfirmasi) tetap di foreground. Setelah konfirmasi, worker
-# dikirim ke background dan layar menampilkan tail -f log.
+# FIX #1: Worker dipanggil via argumen eksplisit (bukan source).
+# FIX #2: trap INT dimatikan sebelum tail -f foreground.
 # FIX #3: Prompt konfirmasi menggunakan echo -en + read -r terpisah
-# agar kode ANSI tidak muncul sebagai teks mentah di Termux/klien SSH.
+# agar kode ANSI tidak muncul sebagai teks mentah di Termux/klien SSH tertentu
 do_restore() {
     echo -e "\n${CYAN}${BOLD}═══════ PROSES RESTORE ═══════${NC}"
     log STEP "Mengambil daftar backup dari Google Drive..."
@@ -534,30 +528,23 @@ do_restore() {
     echo -e "${YELLOW}[»] Tekan Ctrl+C kapan saja untuk berhenti memantau —${NC}"
     echo -e "${YELLOW}    proses restore TETAP berjalan di background.${NC}\n"
 
-    # Ekspor variabel yang dibutuhkan worker, lalu lempar ke background
+    # FIX #1: Gunakan argumen eksplisit, bukan source
     local escaped_rfile; escaped_rfile=$(printf '%q' "$rfile")
     local escaped_target; escaped_target=$(printf '%q' "$remote_target")
 
-    nohup bash -c "
-        source '$SCRIPT_PATH'
-        _restore_worker $escaped_rfile $escaped_target
-    " >> "$LOG_FILE" 2>&1 &
+    nohup bash "$SCRIPT_PATH" --run-worker-restore "$escaped_rfile" "$escaped_target" >> "$LOG_FILE" 2>&1 &
     local bg_pid=$!
     disown "$bg_pid"
 
     echo -e "${GREEN}[✓] Worker restore berjalan (PID: ${bg_pid}).${NC}"
     echo -e "${CYAN}[»] Menampilkan log secara langsung (Ctrl+C untuk berhenti memantau)...${NC}\n"
 
-    (
-        trap 'exit 0' INT
-        tail -f "$LOG_FILE" --pid="$bg_pid" 2>/dev/null \
-            || tail -f "$LOG_FILE"
-    ) &
-    local tail_pid=$!
-
-    wait "$bg_pid" 2>/dev/null || true
-    kill "$tail_pid" 2>/dev/null || true
-    wait "$tail_pid" 2>/dev/null || true
+    # FIX #2: Matikan trap INT sebelum tail foreground agar
+    # Ctrl+C hanya menghentikan tail, bukan memanggil cleanup
+    trap - INT
+    tail -f "$LOG_FILE" --pid="$bg_pid" 2>/dev/null \
+        || tail -f "$LOG_FILE"
+    trap 'log ERROR "Proses dibatalkan oleh pengguna."; exit 130' INT TERM
 
     echo -e "\n${GREEN}${BOLD}[✓] Proses restore telah selesai. Cek log untuk detail: $LOG_FILE${NC}"
 }
@@ -767,6 +754,18 @@ main() {
         install_deps
         setup_gdrive
         do_backup
+        exit 0
+    fi
+
+    # FIX #1: Penangkap parameter worker — script langsung eksekusi
+    # fungsi worker dan exit, tanpa masuk ke menu interaktif
+    if [ "${1:-}" == "--run-worker-backup" ]; then
+        _backup_worker
+        exit 0
+    fi
+
+    if [ "${1:-}" == "--run-worker-restore" ]; then
+        _restore_worker "$2" "$3"
         exit 0
     fi
 
