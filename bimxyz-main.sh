@@ -753,7 +753,7 @@ main() {
         log INFO "=== BACKUP OTOMATIS DIMULAI (CRON) ==="
         install_deps
         setup_gdrive
-        do_backup
+        _backup_worker
         exit 0
     fi
 
