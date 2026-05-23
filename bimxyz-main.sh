@@ -152,7 +152,7 @@ get_remote_target() {
     local folder_id
     folder_id=$(resolve_gdrive_folder_id 2>/dev/null || echo "")
     if [ -n "$folder_id" ]; then
-        echo "$REMOTE_NAME:{$folder_id}"
+        echo "$REMOTE_NAME:$folder_id"
     else
         echo "$REMOTE_NAME:$GDRIVE_FOLDER"
     fi
