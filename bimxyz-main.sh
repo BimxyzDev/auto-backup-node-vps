@@ -148,11 +148,15 @@ resolve_gdrive_folder_id() {
     echo "$folder_id"
 }
 
-get_remote_target() {
+get_folder_id() {
+    resolve_gdrive_folder_id 2>/dev/null || echo ""
+}
+
+build_remote() {
     local folder_id
-    folder_id=$(resolve_gdrive_folder_id 2>/dev/null || echo "")
+    folder_id=$(get_folder_id)
     if [ -n "$folder_id" ]; then
-        echo "${REMOTE_NAME}:{${folder_id}}"
+        echo "${REMOTE_NAME}:{$folder_id}"
     else
         echo "${REMOTE_NAME}:${GDRIVE_FOLDER}"
     fi
@@ -330,8 +334,14 @@ _backup_worker() {
     mkdir -p "$TEMP_DIR"
     check_disk_space "$PTERO_PATH"
 
-    local remote_target; remote_target=$(get_remote_target)
-    log STEP "Tujuan remote: $remote_target"
+    local folder_id; folder_id=$(get_folder_id)
+    local remote_label
+    if [ -n "$folder_id" ]; then
+        remote_label="${REMOTE_NAME}:{$folder_id}"
+    else
+        remote_label="${REMOTE_NAME}:${GDRIVE_FOLDER}"
+    fi
+    log STEP "Tujuan remote: $remote_label"
 
     local wings_was_running=false
     if systemctl is-active --quiet wings 2>/dev/null; then
@@ -351,8 +361,13 @@ _backup_worker() {
     log INFO "Kompresi selesai: ${fsize} dalam ${elapsed} detik."
 
     log STEP "Mengunggah ke Google Drive..."
-    rclone_retry copy "$tmpf" "$remote_target" \
-        || { log ERROR "Pengunggahan gagal."; exit 1; }
+    if [ -n "$folder_id" ]; then
+        rclone_retry copy "$tmpf" "${REMOTE_NAME}:{$folder_id}" \
+            || { log ERROR "Pengunggahan gagal."; exit 1; }
+    else
+        rclone_retry copy "$tmpf" "${REMOTE_NAME}:${GDRIVE_FOLDER}" \
+            || { log ERROR "Pengunggahan gagal."; exit 1; }
+    fi
 
     rm -f "$tmpf"
 
@@ -365,16 +380,22 @@ _backup_worker() {
     fi
 
     log STEP "Menghapus backup yang lebih lama dari ${RETENTION_DAYS} hari..."
-    rclone delete "$remote_target" \
-        --min-age "${RETENTION_DAYS}d" \
-        --include "${node}_*.tar.gz" 2>/dev/null || true
+    if [ -n "$folder_id" ]; then
+        rclone delete "${REMOTE_NAME}:{$folder_id}" \
+            --min-age "${RETENTION_DAYS}d" \
+            --include "${node}_*.tar.gz" 2>/dev/null || true
+    else
+        rclone delete "${REMOTE_NAME}:${GDRIVE_FOLDER}" \
+            --min-age "${RETENTION_DAYS}d" \
+            --include "${node}_*.tar.gz" 2>/dev/null || true
+    fi
 
     log INFO "========================================"
     log INFO "  ✅  BACKUP BERHASIL!"
     log INFO "  Node  : $node"
     log INFO "  File  : $fname"
     log INFO "  Ukuran: $fsize"
-    log INFO "  Drive : $remote_target"
+    log INFO "  Drive : $remote_label"
     log INFO "========================================"
     log INFO "BACKUP SELESAI: $fname ($fsize)"
 }
@@ -412,7 +433,7 @@ do_backup() {
 # ─── LOGIKA INTI RESTORE (dijalankan di background) ───────────
 _restore_worker() {
     local rfile="$1"
-    local remote_target="$2"
+    local folder_id="$2"
 
     log STEP "=== RESTORE WORKER DIMULAI (PID: $$) ==="
 
@@ -420,8 +441,13 @@ _restore_worker() {
     local local_file="$TEMP_DIR/$rfile"
 
     log STEP "Mengunduh file: $rfile"
-    rclone_retry copy --include "$rfile" "$remote_target" "$TEMP_DIR/" \
-        || { log ERROR "Pengunduhan gagal."; exit 1; }
+    if [ -n "$folder_id" ]; then
+        rclone_retry copy --include "$rfile" "${REMOTE_NAME}:{$folder_id}" "$TEMP_DIR/" \
+            || { log ERROR "Pengunduhan gagal."; exit 1; }
+    else
+        rclone_retry copy --include "$rfile" "${REMOTE_NAME}:${GDRIVE_FOLDER}" "$TEMP_DIR/" \
+            || { log ERROR "Pengunduhan gagal."; exit 1; }
+    fi
 
     log STEP "Memverifikasi integritas arsip..."
     tar -tzf "$local_file" >/dev/null 2>&1 \
@@ -481,11 +507,15 @@ do_restore() {
     echo -e "\n${CYAN}${BOLD}═══════ PROSES RESTORE ═══════${NC}"
     log STEP "Mengambil daftar backup dari Google Drive..."
 
-    local remote_target; remote_target=$(get_remote_target)
+    local folder_id; folder_id=$(get_folder_id)
     local list
-    list=$(rclone lsf "$remote_target" --include "*.tar.gz" 2>/dev/null | sort -r) || true
+    if [ -n "$folder_id" ]; then
+        list=$(rclone lsf "${REMOTE_NAME}:{$folder_id}" --include "*.tar.gz" 2>/dev/null | sort -r) || true
+    else
+        list=$(rclone lsf "${REMOTE_NAME}:${GDRIVE_FOLDER}" --include "*.tar.gz" 2>/dev/null | sort -r) || true
+    fi
 
-    [ -z "$list" ] && { log ERROR "Tidak ada backup yang tersedia di Google Drive. (target: $remote_target)"; exit 1; }
+    [ -z "$list" ] && { log ERROR "Tidak ada backup yang tersedia di Google Drive."; exit 1; }
 
     echo -e "\n${YELLOW}${BOLD}Daftar Backup yang Tersedia:${NC}"
     echo -e "${CYAN}──────────────────────────────────────────────${NC}"
@@ -495,9 +525,15 @@ do_restore() {
     while IFS= read -r f; do
         files+=("$f")
         local sz
-        sz=$(rclone size "$remote_target/$f" --json 2>/dev/null \
-            | python3 -c "import sys,json; d=json.load(sys.stdin); mb=d['bytes']//1024//1024; print(f'{mb}MB')" \
-            2>/dev/null || echo "?")
+        if [ -n "$folder_id" ]; then
+            sz=$(rclone size "${REMOTE_NAME}:{$folder_id}/$f" --json 2>/dev/null \
+                | python3 -c "import sys,json; d=json.load(sys.stdin); mb=d['bytes']//1024//1024; print(f'{mb}MB')" \
+                2>/dev/null || echo "?")
+        else
+            sz=$(rclone size "${REMOTE_NAME}:${GDRIVE_FOLDER}/$f" --json 2>/dev/null \
+                | python3 -c "import sys,json; d=json.load(sys.stdin); mb=d['bytes']//1024//1024; print(f'{mb}MB')" \
+                2>/dev/null || echo "?")
+        fi
         echo -e "  ${BOLD}[$i]${NC} $f ${YELLOW}($sz)${NC}"
         (( i++ )) || true
     done <<< "$list"
@@ -530,9 +566,9 @@ do_restore() {
 
     # FIX #1: Gunakan argumen eksplisit, bukan source
     local escaped_rfile; escaped_rfile=$(printf '%q' "$rfile")
-    local escaped_target; escaped_target=$(printf '%q' "$remote_target")
+    local escaped_id; escaped_id=$(printf '%q' "$folder_id")
 
-    nohup bash "$SCRIPT_PATH" --run-worker-restore "$escaped_rfile" "$escaped_target" >> "$LOG_FILE" 2>&1 &
+    nohup bash "$SCRIPT_PATH" --run-worker-restore "$escaped_rfile" "$escaped_id" >> "$LOG_FILE" 2>&1 &
     local bg_pid=$!
     disown "$bg_pid"
 
@@ -651,8 +687,13 @@ show_status() {
 
     {
         if gdrive_is_alive 2>/dev/null; then
-            local remote_target; remote_target=$(get_remote_target 2>/dev/null || echo "$REMOTE_NAME:$GDRIVE_FOLDER")
-            local count; count=$(rclone lsf "$remote_target" --include "*.tar.gz" 2>/dev/null | wc -l) || count="?"
+            local fid; fid=$(get_folder_id 2>/dev/null || echo "")
+            local count
+            if [ -n "$fid" ]; then
+                count=$(rclone lsf "${REMOTE_NAME}:{$fid}" --include "*.tar.gz" 2>/dev/null | wc -l) || count="?"
+            else
+                count=$(rclone lsf "${REMOTE_NAME}:${GDRIVE_FOLDER}" --include "*.tar.gz" 2>/dev/null | wc -l) || count="?"
+            fi
             echo -e "  Google Drive : ${GREEN}${BOLD}TERHUBUNG ✓${NC} ($count backup tersedia)"
         else
             echo -e "  Google Drive : ${RED}${BOLD}TIDAK TERHUBUNG ✗${NC}"
