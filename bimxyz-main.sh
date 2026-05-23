@@ -152,9 +152,9 @@ get_remote_target() {
     local folder_id
     folder_id=$(resolve_gdrive_folder_id 2>/dev/null || echo "")
     if [ -n "$folder_id" ]; then
-        echo "$REMOTE_NAME:$folder_id"
+        echo "${REMOTE_NAME}:{${folder_id}}"
     else
-        echo "$REMOTE_NAME:$GDRIVE_FOLDER"
+        echo "${REMOTE_NAME}:${GDRIVE_FOLDER}"
     fi
 }
 
@@ -420,7 +420,7 @@ _restore_worker() {
     local local_file="$TEMP_DIR/$rfile"
 
     log STEP "Mengunduh file: $rfile"
-    rclone_retry copy "$remote_target/$rfile" "$TEMP_DIR/" \
+    rclone_retry copy --include "$rfile" "$remote_target" "$TEMP_DIR/" \
         || { log ERROR "Pengunduhan gagal."; exit 1; }
 
     log STEP "Memverifikasi integritas arsip..."
