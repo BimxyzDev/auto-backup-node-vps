@@ -1,12 +1,6 @@
 #!/bin/bash
-# ╔══════════════════════════════════════════════════════════════╗
-# ║   BIMXYZ ULTIMATE BACKUP SYSTEM V5.0                        ║
-# ║   Enterprise Grade | Multi-Server | Timezone-Aware Cron     ║
-# ╚══════════════════════════════════════════════════════════════╝
-
 set -uo pipefail
 
-# FIX: Deklarasikan PATH agar dikenali oleh Cron saat Auto-Backup
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # ─── KONSTANTA ────────────────────────────────────────────────
@@ -15,11 +9,10 @@ readonly REMOTE_NAME="gdrive_bimxyz"
 readonly GDRIVE_FOLDER="Backup_Bimxyz"
 readonly PTERO_PATH="/var/lib/pterodactyl/volumes"
 readonly CONFIG_DIR="/root/.bimxyz"
-readonly TEMP_DIR="/root/.bimxyz_temp"
+readonly BACKUP_DIR="/root/bimxyz_backup"
+readonly TEMP_DIR="$BACKUP_DIR/.tmp"
 readonly NODE_CONFIG="$CONFIG_DIR/node.conf"
-readonly FOLDER_ID_CACHE="$CONFIG_DIR/gdrive_folder_id.cache"
 readonly LOG_FILE="/var/log/bimxyz_backup.log"
-# FIX #3: Path dinamis — tidak lagi hardcode
 readonly SCRIPT_PATH="$(readlink -f "$0")"
 readonly MAX_RETRIES=3
 readonly RETENTION_DAYS=7
@@ -29,9 +22,6 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'
 YELLOW='\033[1;33m'; BOLD='\033[1m'; NC='\033[0m'
 
 # ─── LOGGING ──────────────────────────────────────────────────
-# FIX #2: Semua echo -e dekoratif dialihkan ke stderr (>&2)
-# sehingga tidak merusak command substitution seperti:
-#   folder_id=$(resolve_gdrive_folder_id)
 log() {
     local level="$1"; shift
     local msg="$*"
@@ -44,7 +34,6 @@ log() {
         STEP)  echo -e "${CYAN}[»] $msg${NC}" >&2 ;;
     esac
 }
-
 
 # ─── PEMBERSIHAN ──────────────────────────────────────────────
 cleanup() {
@@ -106,60 +95,13 @@ auto_repair_rclone_config() {
     log INFO "Perbaikan otomatis konfigurasi rclone berhasil."
 }
 
-# ─── PENCARIAN FOLDER ID GOOGLE DRIVE ─────────────────────────
-_gdrive_lsjson_find() {
-    python3 -c "
-import json, sys
-items = json.load(sys.stdin)
-for item in items:
-    if item.get('IsDir') and item.get('Name') == '${GDRIVE_FOLDER}':
-        print(item.get('ID', ''))
-        break
-" 2>/dev/null || echo ""
-}
-
-resolve_gdrive_folder_id() {
-    if [ -f "$FOLDER_ID_CACHE" ]; then
-        local age=$(( $(date +%s) - $(stat -c %Y "$FOLDER_ID_CACHE" 2>/dev/null || echo 0) ))
-        [ "$age" -lt 86400 ] && { cat "$FOLDER_ID_CACHE"; return 0; }
-    fi
-
-    log STEP "Mencari Folder ID untuk '$GDRIVE_FOLDER'..."
-
-    local folder_id
-    folder_id=$(rclone lsjson "$REMOTE_NAME:" --drive-trashed-only=false 2>/dev/null | _gdrive_lsjson_find)
-
-    if [ -z "$folder_id" ]; then
-        log STEP "Tidak ditemukan di Drive Utama — mencari di folder 'Dibagikan ke Saya'..."
-        folder_id=$(rclone lsjson "$REMOTE_NAME:" --drive-shared-with-me --drive-trashed-only=false 2>/dev/null | _gdrive_lsjson_find)
-    fi
-
-    if [ -z "$folder_id" ]; then
-        log WARN "Folder '$GDRIVE_FOLDER' tidak ditemukan — membuat folder baru..."
-        rclone mkdir "$REMOTE_NAME:$GDRIVE_FOLDER" 2>/dev/null \
-            || { log ERROR "Gagal membuat folder '$GDRIVE_FOLDER' di Google Drive."; return 1; }
-        folder_id=$(rclone lsjson "$REMOTE_NAME:" --drive-trashed-only=false 2>/dev/null | _gdrive_lsjson_find)
-    fi
-
-    [ -z "$folder_id" ] && { log ERROR "Gagal mendapatkan Folder ID untuk '$GDRIVE_FOLDER'."; return 1; }
-
-    echo "$folder_id" > "$FOLDER_ID_CACHE"
-    log INFO "Folder ID ditemukan: $folder_id (tersimpan di cache)."
-    echo "$folder_id"
-}
-
-get_folder_id() {
-    resolve_gdrive_folder_id 2>/dev/null || echo ""
-}
-
-build_remote() {
-    local folder_id
-    folder_id=$(get_folder_id)
-    if [ -n "$folder_id" ]; then
-        echo "${REMOTE_NAME}:{$folder_id}"
-    else
-        echo "${REMOTE_NAME}:${GDRIVE_FOLDER}"
-    fi
+# ─── PASTIKAN FOLDER GDRIVE ADA (AUTO-CREATE) ─────────────────
+ensure_gdrive_folder() {
+    rclone lsf "${REMOTE_NAME}:" 2>/dev/null | grep -q "^${GDRIVE_FOLDER}/$" && return 0
+    log STEP "Folder '$GDRIVE_FOLDER' belum ada — membuat folder baru di Google Drive..."
+    rclone mkdir "${REMOTE_NAME}:${GDRIVE_FOLDER}" 2>/dev/null \
+        || { log ERROR "Gagal membuat folder '$GDRIVE_FOLDER' di Google Drive."; return 1; }
+    log INFO "Folder '$GDRIVE_FOLDER' berhasil dibuat."
 }
 
 # ─── KONEKSI GOOGLE DRIVE ─────────────────────────────────────
@@ -177,7 +119,6 @@ setup_gdrive() {
     fi
 
     rclone config delete "$REMOTE_NAME" 2>/dev/null || true
-    rm -f "$FOLDER_ID_CACHE"
 
     echo -e "\n${CYAN}${BOLD}═══════ PENGATURAN GOOGLE DRIVE ═══════${NC}"
     echo -e "  ${BOLD}1.${NC} Service Account JSON ${GREEN}[Direkomendasikan — untuk banyak server]${NC}"
@@ -325,6 +266,8 @@ _backup_worker() {
     local stamp; stamp=$(date +%Y-%m-%d_%H-%M-%S)
     local fname="${node}_${stamp}.tar.gz"
     local tmpf="$TEMP_DIR/$fname"
+    local destf="$BACKUP_DIR/$fname"
+    local remote="${REMOTE_NAME}:${GDRIVE_FOLDER}"
 
     log STEP "=== BACKUP WORKER DIMULAI (PID: $$) ==="
     log STEP "Node: $node | Nama file: $fname"
@@ -332,16 +275,11 @@ _backup_worker() {
     [ -d "$PTERO_PATH" ] || { log ERROR "Direktori tidak ditemukan: $PTERO_PATH"; exit 1; }
 
     mkdir -p "$TEMP_DIR"
+    mkdir -p "$BACKUP_DIR"
     check_disk_space "$PTERO_PATH"
+    ensure_gdrive_folder || exit 1
 
-    local folder_id; folder_id=$(get_folder_id)
-    local remote_label
-    if [ -n "$folder_id" ]; then
-        remote_label="${REMOTE_NAME}:{$folder_id}"
-    else
-        remote_label="${REMOTE_NAME}:${GDRIVE_FOLDER}"
-    fi
-    log STEP "Tujuan remote: $remote_label"
+    log STEP "Tujuan remote: $remote"
 
     local wings_was_running=false
     if systemctl is-active --quiet wings 2>/dev/null; then
@@ -360,16 +298,12 @@ _backup_worker() {
     local fsize; fsize=$(du -sh "$tmpf" | awk '{print $1}')
     log INFO "Kompresi selesai: ${fsize} dalam ${elapsed} detik."
 
-    log STEP "Mengunggah ke Google Drive..."
-    if [ -n "$folder_id" ]; then
-        rclone_retry copy "$tmpf" "${REMOTE_NAME}:{$folder_id}" \
-            || { log ERROR "Pengunggahan gagal."; exit 1; }
-    else
-        rclone_retry copy "$tmpf" "${REMOTE_NAME}:${GDRIVE_FOLDER}" \
-            || { log ERROR "Pengunggahan gagal."; exit 1; }
-    fi
+    log STEP "Mengunggah ke Google Drive ($remote)..."
+    rclone_retry copy "$tmpf" "$remote" \
+        || { log ERROR "Pengunggahan gagal."; exit 1; }
 
-    rm -f "$tmpf"
+    mv "$tmpf" "$destf"
+    log INFO "Backup disimpan lokal: $destf"
 
     if $wings_was_running; then
         log STEP "Menjalankan kembali Wings..."
@@ -379,32 +313,26 @@ _backup_worker() {
             || log WARN "Wings gagal dijalankan — periksa dengan: systemctl status wings"
     fi
 
-    log STEP "Menghapus backup yang lebih lama dari ${RETENTION_DAYS} hari..."
-    if [ -n "$folder_id" ]; then
-        rclone delete "${REMOTE_NAME}:{$folder_id}" \
-            --min-age "${RETENTION_DAYS}d" \
-            --include "${node}_*.tar.gz" 2>/dev/null || true
-    else
-        rclone delete "${REMOTE_NAME}:${GDRIVE_FOLDER}" \
-            --min-age "${RETENTION_DAYS}d" \
-            --include "${node}_*.tar.gz" 2>/dev/null || true
-    fi
+    log STEP "Menghapus backup lokal yang lebih lama dari ${RETENTION_DAYS} hari..."
+    find "$BACKUP_DIR" -maxdepth 1 -name "${node}_*.tar.gz" -mtime +${RETENTION_DAYS} -delete 2>/dev/null || true
+
+    log STEP "Menghapus backup remote yang lebih lama dari ${RETENTION_DAYS} hari..."
+    rclone delete "$remote" \
+        --min-age "${RETENTION_DAYS}d" \
+        --include "${node}_*.tar.gz" 2>/dev/null || true
 
     log INFO "========================================"
     log INFO "  ✅  BACKUP BERHASIL!"
     log INFO "  Node  : $node"
     log INFO "  File  : $fname"
     log INFO "  Ukuran: $fsize"
-    log INFO "  Drive : $remote_label"
+    log INFO "  Lokal : $destf"
+    log INFO "  Drive : $remote"
     log INFO "========================================"
     log INFO "BACKUP SELESAI: $fname ($fsize)"
 }
 
 # ─── PROSES BACKUP (dengan SIGHUP-proof background execution) ─
-# FIX #1: Worker dipanggil via argumen eksplisit (bukan source),
-# sehingga tidak memicu loop menu utama.
-# FIX #2: trap INT dimatikan sebelum tail -f foreground agar
-# Ctrl+C tidak memanggil cleanup dan menghapus TEMP_DIR.
 do_backup() {
     echo -e "\n${CYAN}${BOLD}═══════ PROSES BACKUP ═══════${NC}"
     echo -e "${YELLOW}[»] Proses backup dijalankan di background (kebal SIGHUP).${NC}"
@@ -412,7 +340,6 @@ do_backup() {
     echo -e "${YELLOW}[»] Tekan Ctrl+C kapan saja untuk berhenti memantau —${NC}"
     echo -e "${YELLOW}    proses backup TETAP berjalan di background.${NC}\n"
 
-    # FIX #1: Gunakan argumen eksplisit, bukan source
     nohup bash "$SCRIPT_PATH" --run-worker-backup >> "$LOG_FILE" 2>&1 &
     local bg_pid=$!
     disown "$bg_pid"
@@ -420,8 +347,6 @@ do_backup() {
     echo -e "${GREEN}[✓] Worker backup berjalan (PID: ${bg_pid}).${NC}"
     echo -e "${CYAN}[»] Menampilkan log secara langsung (Ctrl+C untuk berhenti memantau)...${NC}\n"
 
-    # FIX #2: Matikan trap INT sebelum tail foreground agar
-    # Ctrl+C hanya menghentikan tail, bukan memanggil cleanup
     trap - INT
     tail -f "$LOG_FILE" --pid="$bg_pid" 2>/dev/null \
         || tail -f "$LOG_FILE"
@@ -433,21 +358,16 @@ do_backup() {
 # ─── LOGIKA INTI RESTORE (dijalankan di background) ───────────
 _restore_worker() {
     local rfile="$1"
-    local folder_id="$2"
+    local remote="${REMOTE_NAME}:${GDRIVE_FOLDER}"
 
     log STEP "=== RESTORE WORKER DIMULAI (PID: $$) ==="
 
     mkdir -p "$TEMP_DIR"
     local local_file="$TEMP_DIR/$rfile"
 
-    log STEP "Mengunduh file: $rfile"
-    if [ -n "$folder_id" ]; then
-        rclone_retry copy --include "$rfile" "${REMOTE_NAME}:{$folder_id}" "$TEMP_DIR/" \
-            || { log ERROR "Pengunduhan gagal."; exit 1; }
-    else
-        rclone_retry copy --include "$rfile" "${REMOTE_NAME}:${GDRIVE_FOLDER}" "$TEMP_DIR/" \
-            || { log ERROR "Pengunduhan gagal."; exit 1; }
-    fi
+    log STEP "Mengunduh file: $rfile dari $remote"
+    rclone_retry copy --include "$rfile" "$remote" "$TEMP_DIR/" \
+        || { log ERROR "Pengunduhan gagal."; exit 1; }
 
     log STEP "Memverifikasi integritas arsip..."
     tar -tzf "$local_file" >/dev/null 2>&1 \
@@ -499,21 +419,13 @@ _restore_worker() {
 }
 
 # ─── PROSES RESTORE (dengan SIGHUP-proof background execution) ─
-# FIX #1: Worker dipanggil via argumen eksplisit (bukan source).
-# FIX #2: trap INT dimatikan sebelum tail -f foreground.
-# FIX #3: Prompt konfirmasi menggunakan echo -en + read -r terpisah
-# agar kode ANSI tidak muncul sebagai teks mentah di Termux/klien SSH tertentu
 do_restore() {
     echo -e "\n${CYAN}${BOLD}═══════ PROSES RESTORE ═══════${NC}"
     log STEP "Mengambil daftar backup dari Google Drive..."
 
-    local folder_id; folder_id=$(get_folder_id)
+    local remote="${REMOTE_NAME}:${GDRIVE_FOLDER}"
     local list
-    if [ -n "$folder_id" ]; then
-        list=$(rclone lsf "${REMOTE_NAME}:{$folder_id}" --include "*.tar.gz" 2>/dev/null | sort -r) || true
-    else
-        list=$(rclone lsf "${REMOTE_NAME}:${GDRIVE_FOLDER}" --include "*.tar.gz" 2>/dev/null | sort -r) || true
-    fi
+    list=$(rclone lsf "$remote" --include "*.tar.gz" 2>/dev/null | sort -r) || true
 
     [ -z "$list" ] && { log ERROR "Tidak ada backup yang tersedia di Google Drive."; exit 1; }
 
@@ -525,15 +437,9 @@ do_restore() {
     while IFS= read -r f; do
         files+=("$f")
         local sz
-        if [ -n "$folder_id" ]; then
-            sz=$(rclone size "${REMOTE_NAME}:{$folder_id}/$f" --json 2>/dev/null \
-                | python3 -c "import sys,json; d=json.load(sys.stdin); mb=d['bytes']//1024//1024; print(f'{mb}MB')" \
-                2>/dev/null || echo "?")
-        else
-            sz=$(rclone size "${REMOTE_NAME}:${GDRIVE_FOLDER}/$f" --json 2>/dev/null \
-                | python3 -c "import sys,json; d=json.load(sys.stdin); mb=d['bytes']//1024//1024; print(f'{mb}MB')" \
-                2>/dev/null || echo "?")
-        fi
+        sz=$(rclone size "${remote}/$f" --json 2>/dev/null \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); mb=d['bytes']//1024//1024; print(f'{mb}MB')" \
+            2>/dev/null || echo "?")
         echo -e "  ${BOLD}[$i]${NC} $f ${YELLOW}($sz)${NC}"
         (( i++ )) || true
     done <<< "$list"
@@ -553,8 +459,6 @@ do_restore() {
     echo -e "${YELLOW}  • Data lama akan dipindahkan ke /root/volumes_snapshot_*${NC}"
     echo ""
 
-    # FIX #3: Pisahkan echo prompt dan read agar ANSI color
-    # tidak muncul sebagai karakter mentah di Termux / klien SSH tertentu
     echo -en "Ketik ${BOLD}RESTORE${NC} untuk melanjutkan: "
     read -r confirm
 
@@ -564,19 +468,15 @@ do_restore() {
     echo -e "${YELLOW}[»] Tekan Ctrl+C kapan saja untuk berhenti memantau —${NC}"
     echo -e "${YELLOW}    proses restore TETAP berjalan di background.${NC}\n"
 
-    # FIX #1: Gunakan argumen eksplisit, bukan source
     local escaped_rfile; escaped_rfile=$(printf '%q' "$rfile")
-    local escaped_id; escaped_id=$(printf '%q' "$folder_id")
 
-    nohup bash "$SCRIPT_PATH" --run-worker-restore "$escaped_rfile" "$escaped_id" >> "$LOG_FILE" 2>&1 &
+    nohup bash "$SCRIPT_PATH" --run-worker-restore "$escaped_rfile" >> "$LOG_FILE" 2>&1 &
     local bg_pid=$!
     disown "$bg_pid"
 
     echo -e "${GREEN}[✓] Worker restore berjalan (PID: ${bg_pid}).${NC}"
     echo -e "${CYAN}[»] Menampilkan log secara langsung (Ctrl+C untuk berhenti memantau)...${NC}\n"
 
-    # FIX #2: Matikan trap INT sebelum tail foreground agar
-    # Ctrl+C hanya menghentikan tail, bukan memanggil cleanup
     trap - INT
     tail -f "$LOG_FILE" --pid="$bg_pid" 2>/dev/null \
         || tail -f "$LOG_FILE"
@@ -687,14 +587,9 @@ show_status() {
 
     {
         if gdrive_is_alive 2>/dev/null; then
-            local fid; fid=$(get_folder_id 2>/dev/null || echo "")
             local count
-            if [ -n "$fid" ]; then
-                count=$(rclone lsf "${REMOTE_NAME}:{$fid}" --include "*.tar.gz" 2>/dev/null | wc -l) || count="?"
-            else
-                count=$(rclone lsf "${REMOTE_NAME}:${GDRIVE_FOLDER}" --include "*.tar.gz" 2>/dev/null | wc -l) || count="?"
-            fi
-            echo -e "  Google Drive : ${GREEN}${BOLD}TERHUBUNG ✓${NC} ($count backup tersedia)"
+            count=$(rclone lsf "${REMOTE_NAME}:${GDRIVE_FOLDER}" --include "*.tar.gz" 2>/dev/null | wc -l) || count="?"
+            echo -e "  Google Drive : ${GREEN}${BOLD}TERHUBUNG ✓${NC} ($count backup tersedia di '$GDRIVE_FOLDER')"
         else
             echo -e "  Google Drive : ${RED}${BOLD}TIDAK TERHUBUNG ✗${NC}"
         fi
@@ -722,7 +617,6 @@ show_status() {
         fi
     } || echo -e "  Backup Otomatis : ${YELLOW}${BOLD}PEMERIKSAAN GAGAL${NC}"
 
-    # --- INDIKATOR PROSES BACKGROUND ---
     {
         if pgrep -f "_backup_worker" >/dev/null; then
             echo -e "  Aktivitas Saat Ini: ${YELLOW}${BOLD}⏳ BACKUP SEDANG BERJALAN...${NC}"
@@ -732,7 +626,6 @@ show_status() {
             echo -e "  Aktivitas Saat Ini: ${GREEN}${BOLD}IDLE (Standby)${NC}"
         fi
     }
-    # -----------------------------------
 
     {
         local last
@@ -740,9 +633,14 @@ show_status() {
         [ -n "$last" ] && echo -e "  Operasi Terakhir: ${BOLD}$(echo "$last" | cut -d' ' -f1-3)${NC} — $(echo "$last" | cut -d']' -f3-)"
     } || true
 
+    {
+        local local_count
+        local_count=$(find "$BACKUP_DIR" -maxdepth 1 -name "*.tar.gz" 2>/dev/null | wc -l) || local_count="?"
+        echo -e "  Backup Lokal : ${BOLD}$local_count file di $BACKUP_DIR${NC}"
+    } || true
+
     echo ""
 }
-
 
 # ─── BANNER ───────────────────────────────────────────────────
 show_banner() {
@@ -776,7 +674,7 @@ show_menu() {
         5) show_status ;;
         6)
             rclone config delete "$REMOTE_NAME" 2>/dev/null || true
-            rm -f "$CONFIG_DIR/service_account.json" "$FOLDER_ID_CACHE"
+            rm -f "$CONFIG_DIR/service_account.json"
             log INFO "Autentikasi berhasil direset. Jalankan skrip kembali untuk mengonfigurasi ulang."
             ;;
         7) exit 0 ;;
@@ -787,7 +685,7 @@ show_menu() {
 # ─── TITIK MASUK UTAMA ────────────────────────────────────────
 main() {
     check_root
-    mkdir -p "$CONFIG_DIR"
+    mkdir -p "$CONFIG_DIR" "$BACKUP_DIR"
     touch "$LOG_FILE"
 
     if [ "${1:-}" == "--auto-backup" ]; then
@@ -798,15 +696,13 @@ main() {
         exit 0
     fi
 
-    # FIX #1: Penangkap parameter worker — script langsung eksekusi
-    # fungsi worker dan exit, tanpa masuk ke menu interaktif
     if [ "${1:-}" == "--run-worker-backup" ]; then
         _backup_worker
         exit 0
     fi
 
     if [ "${1:-}" == "--run-worker-restore" ]; then
-        _restore_worker "$2" "$3"
+        _restore_worker "$2"
         exit 0
     fi
 
@@ -817,7 +713,7 @@ main() {
         show_banner
         show_status
         show_menu
-        
+
         echo -e "\n${CYAN}──────────────────────────────────────────────${NC}"
         read -rp "Tekan [ENTER] untuk kembali ke Menu Utama..."
     done
