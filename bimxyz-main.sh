@@ -4,7 +4,7 @@ set -uo pipefail
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # ─── KONSTANTA ────────────────────────────────────────────────
-readonly VERSION="5.0"
+readonly VERSION="5.1"
 readonly REMOTE_NAME="gdrive_bimxyz"
 readonly GDRIVE_FOLDER="Backup_Bimxyz"
 readonly PTERO_PATH="/var/lib/pterodactyl/volumes"
@@ -13,6 +13,7 @@ readonly BACKUP_DIR="/root/bimxyz_backup"
 readonly TEMP_DIR="$BACKUP_DIR/.tmp"
 readonly NODE_CONFIG="$CONFIG_DIR/node.conf"
 readonly LOG_FILE="/var/log/bimxyz_backup.log"
+readonly ACTIVITY_LOG="/var/log/bimxyz_activity.log"
 readonly SCRIPT_PATH="$(readlink -f "$0")"
 readonly MAX_RETRIES=3
 readonly RETENTION_DAYS=7
@@ -33,6 +34,16 @@ log() {
         ERROR) echo -e "${RED}[✗] $msg${NC}" >&2 ;;
         STEP)  echo -e "${CYAN}[»] $msg${NC}" >&2 ;;
     esac
+}
+
+# ─── ACTIVITY LOGGING (REAL-TIME) ────────────────────────────
+activity_log() {
+    local action="$1"; shift
+    local detail="$*"
+    local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
+    local node="unknown"
+    [ -f "$NODE_CONFIG" ] && node=$(cat "$NODE_CONFIG" 2>/dev/null || echo "unknown")
+    echo "[$ts] [NODE: $node] [ACTION: $action] $detail" >> "$ACTIVITY_LOG"
 }
 
 # ─── PEMBERSIHAN ──────────────────────────────────────────────
@@ -72,6 +83,220 @@ install_deps() {
         fi
     done
     log INFO "Seluruh dependensi berhasil diinstal."
+}
+
+# ─── SMART SWAP MEMORY & KERNEL OPTIMIZATION ─────────────────
+setup_smart_swap() {
+    echo -e "\n${CYAN}${BOLD}═══════ SMART SWAP MEMORY & KERNEL OPTIMIZATION ═══════${NC}"
+
+    # Cek apakah swap sudah ada
+    local current_swap
+    current_swap=$(swapon --show --noheadings 2>/dev/null)
+
+    if [ -n "$current_swap" ]; then
+        local swap_total
+        swap_total=$(free -h | awk '/^Swap:/{print $2}')
+        echo -e "  ${GREEN}Swap sudah aktif!${NC}"
+        echo -e "  Ukuran saat ini : ${BOLD}${swap_total}${NC}"
+        echo -e "  Detail:"
+        swapon --show 2>/dev/null | sed 's/^/    /'
+        echo ""
+
+        local current_swappiness
+        current_swappiness=$(cat /proc/sys/vm/swappiness 2>/dev/null || echo "?")
+        echo -e "  vm.swappiness   : ${BOLD}${current_swappiness}${NC}"
+        echo ""
+
+        echo -e "  ${BOLD}1.${NC} Ubah ukuran Swap (hapus lama, buat baru)"
+        echo -e "  ${BOLD}2.${NC} Optimasi kernel saja (atur vm.swappiness = 10)"
+        echo -e "  ${BOLD}3.${NC} Kembali ke menu"
+        echo ""
+        read -rp "Pilihan (1-3): " swap_choice
+
+        case "$swap_choice" in
+            1) _create_swap ;;
+            2) _optimize_kernel ;;
+            3) return 0 ;;
+            *) log ERROR "Pilihan tidak valid."; return 1 ;;
+        esac
+    else
+        echo -e "  ${YELLOW}Swap belum dikonfigurasi pada sistem ini.${NC}"
+        echo ""
+
+        local ram_total
+        ram_total=$(free -h | awk '/^Mem:/{print $2}')
+        local disk_free
+        disk_free=$(df -h / | awk 'NR==2{print $4}')
+        echo -e "  RAM Total       : ${BOLD}${ram_total}${NC}"
+        echo -e "  Disk Tersedia   : ${BOLD}${disk_free}${NC}"
+        echo ""
+
+        _create_swap
+    fi
+
+    activity_log "SWAP_SETUP" "Smart Swap & Kernel Optimization selesai dijalankan"
+}
+
+_create_swap() {
+    echo -e "\n${CYAN}Berapa GB ukuran Swap yang diinginkan?${NC}"
+    echo -e "  ${YELLOW}Rekomendasi: 4-20 GB (sesuaikan dengan kebutuhan)${NC}"
+    echo -e "  ${YELLOW}Tips: Untuk RAM 16GB, swap 8-20GB sudah optimal.${NC}"
+    echo ""
+
+    local swap_size_gb
+    while true; do
+        read -rp "Ukuran Swap (dalam GB, contoh: 20): " swap_size_gb
+        [[ "$swap_size_gb" =~ ^[1-9][0-9]*$ ]] && break
+        log WARN "Masukan tidak valid. Masukkan angka bulat positif (dalam GB)."
+    done
+
+    # Cek disk space cukup
+    local disk_free_mb
+    disk_free_mb=$(df -m / | awk 'NR==2{print $4}')
+    local swap_need_mb=$(( swap_size_gb * 1024 ))
+
+    if [ "$disk_free_mb" -lt "$swap_need_mb" ]; then
+        log ERROR "Ruang disk tidak mencukupi. Tersedia: ${disk_free_mb}MB, Diperlukan: ${swap_need_mb}MB."
+        return 1
+    fi
+
+    # Hapus swap lama jika ada
+    if swapon --show --noheadings 2>/dev/null | grep -q "/swapfile"; then
+        log STEP "Menonaktifkan swap lama (/swapfile)..."
+        swapoff /swapfile 2>/dev/null || true
+        rm -f /swapfile
+    fi
+
+    log STEP "Membuat Swap File ${swap_size_gb}GB (memanfaatkan NVMe SSD)..."
+    echo -e "  ${YELLOW}Proses ini mungkin memakan waktu beberapa detik...${NC}"
+
+    # Buat swapfile
+    dd if=/dev/zero of=/swapfile bs=1G count="$swap_size_gb" status=progress 2>&1 | tail -1
+    echo ""
+
+    # Set permission 600
+    log STEP "Mengatur permission swapfile (600)..."
+    chmod 600 /swapfile
+
+    # Format swap
+    log STEP "Menjalankan mkswap..."
+    mkswap /swapfile >/dev/null 2>&1
+
+    # Aktifkan swap
+    log STEP "Mengaktifkan swap (swapon)..."
+    swapon /swapfile
+
+    # Daftarkan ke /etc/fstab agar permanen
+    log STEP "Mendaftarkan ke /etc/fstab agar permanen setelah reboot..."
+    sed -i '/\/swapfile/d' /etc/fstab 2>/dev/null || true
+    echo "/swapfile none swap sw 0 0" >> /etc/fstab
+
+    log INFO "Swap File ${swap_size_gb}GB berhasil dibuat dan diaktifkan!"
+
+    # Optimasi kernel
+    _optimize_kernel
+
+    # Tampilkan hasil
+    echo ""
+    echo -e "  ${GREEN}${BOLD}═══ HASIL KONFIGURASI SWAP ═══${NC}"
+    free -h | grep -E "Mem:|Swap:" | sed 's/^/    /'
+    echo -e "  ${BOLD}vm.swappiness${NC} : $(cat /proc/sys/vm/swappiness)"
+    echo ""
+
+    activity_log "SWAP_CREATE" "Swap ${swap_size_gb}GB dibuat dan diaktifkan, swappiness=10"
+}
+
+_optimize_kernel() {
+    log STEP "Mengoptimasi kernel: vm.swappiness = 10..."
+    echo -e "  ${YELLOW}(Sistem akan mengutamakan RAM fisik sebelum menggunakan Swap)${NC}"
+
+    # Set langsung (aktif instan)
+    sysctl -w vm.swappiness=10 >/dev/null 2>&1
+
+    # Set permanen di /etc/sysctl.conf
+    if grep -q "^vm.swappiness" /etc/sysctl.conf 2>/dev/null; then
+        sed -i 's/^vm.swappiness.*/vm.swappiness=10/' /etc/sysctl.conf
+    else
+        echo "vm.swappiness=10" >> /etc/sysctl.conf
+    fi
+
+    # Tambahan optimasi untuk server hosting
+    local optimizations=(
+        "vm.vfs_cache_pressure=50"
+    )
+
+    for opt in "${optimizations[@]}"; do
+        local key="${opt%%=*}"
+        local val="${opt#*=}"
+        sysctl -w "$key=$val" >/dev/null 2>&1 || true
+        if grep -q "^$key" /etc/sysctl.conf 2>/dev/null; then
+            sed -i "s/^$key.*/$opt/" /etc/sysctl.conf
+        else
+            echo "$opt" >> /etc/sysctl.conf
+        fi
+    done
+
+    log INFO "Kernel optimization selesai: swappiness=10, vfs_cache_pressure=50"
+    activity_log "KERNEL_OPTIMIZE" "vm.swappiness=10, vm.vfs_cache_pressure=50 diterapkan"
+}
+
+# ─── LIHAT LOG AKTIVITAS REAL-TIME ───────────────────────────
+view_activity_log() {
+    echo -e "\n${CYAN}${BOLD}═══════ LOG AKTIVITAS REAL-TIME ═══════${NC}"
+
+    if [ ! -f "$ACTIVITY_LOG" ] || [ ! -s "$ACTIVITY_LOG" ]; then
+        echo -e "  ${YELLOW}Belum ada log aktivitas yang tercatat.${NC}"
+        echo ""
+        return 0
+    fi
+
+    echo -e "  ${BOLD}1.${NC} Tampilkan 20 log terakhir"
+    echo -e "  ${BOLD}2.${NC} Tampilkan semua log"
+    echo -e "  ${BOLD}3.${NC} Monitor real-time (tail -f)"
+    echo -e "  ${BOLD}4.${NC} Filter berdasarkan aksi (BACKUP/RESTORE/SWAP/dll)"
+    echo -e "  ${BOLD}5.${NC} Hapus log aktivitas"
+    echo -e "  ${BOLD}6.${NC} Kembali"
+    echo ""
+    read -rp "Pilihan (1-6): " log_choice
+
+    case "$log_choice" in
+        1)
+            echo -e "\n${CYAN}── 20 Log Aktivitas Terakhir ──${NC}"
+            tail -20 "$ACTIVITY_LOG" | while IFS= read -r line; do
+                echo -e "  ${GREEN}│${NC} $line"
+            done
+            ;;
+        2)
+            echo -e "\n${CYAN}── Seluruh Log Aktivitas ──${NC}"
+            cat "$ACTIVITY_LOG" | while IFS= read -r line; do
+                echo -e "  ${GREEN}│${NC} $line"
+            done
+            ;;
+        3)
+            echo -e "\n${YELLOW}Memantau log secara real-time (Ctrl+C untuk berhenti)...${NC}\n"
+            tail -f "$ACTIVITY_LOG"
+            ;;
+        4)
+            echo ""
+            read -rp "Masukkan filter aksi (contoh: BACKUP, RESTORE, SWAP): " filter
+            filter=$(echo "$filter" | tr '[:lower:]' '[:upper:]')
+            echo -e "\n${CYAN}── Log Aktivitas [$filter] ──${NC}"
+            grep -i "$filter" "$ACTIVITY_LOG" 2>/dev/null | while IFS= read -r line; do
+                echo -e "  ${GREEN}│${NC} $line"
+            done
+            [ "$(grep -ci "$filter" "$ACTIVITY_LOG" 2>/dev/null)" == "0" ] && echo -e "  ${YELLOW}Tidak ada log dengan filter '$filter'.${NC}"
+            ;;
+        5)
+            read -rp "Yakin ingin menghapus seluruh log aktivitas? (y/N): " confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                > "$ACTIVITY_LOG"
+                log INFO "Log aktivitas berhasil dihapus."
+            fi
+            ;;
+        6) return 0 ;;
+        *) log ERROR "Pilihan tidak valid." ;;
+    esac
+    echo ""
 }
 
 # ─── PERBAIKAN OTOMATIS KONFIGURASI RCLONE ────────────────────
@@ -193,6 +418,7 @@ manage_node_name() {
     mkdir -p "$CONFIG_DIR"
     echo "$sanitized" > "$NODE_CONFIG"
     log INFO "Nama node berhasil disimpan: $sanitized"
+    activity_log "NODE_RENAME" "Nama node diubah menjadi: $sanitized"
 }
 
 get_node_name() {
@@ -271,8 +497,9 @@ _backup_worker() {
 
     log STEP "=== BACKUP WORKER DIMULAI (PID: $$) ==="
     log STEP "Node: $node | Nama file: $fname"
+    activity_log "BACKUP_START" "Backup dimulai — File: $fname"
 
-    [ -d "$PTERO_PATH" ] || { log ERROR "Direktori tidak ditemukan: $PTERO_PATH"; exit 1; }
+    [ -d "$PTERO_PATH" ] || { log ERROR "Direktori tidak ditemukan: $PTERO_PATH"; activity_log "BACKUP_FAIL" "Direktori $PTERO_PATH tidak ditemukan"; exit 1; }
 
     mkdir -p "$TEMP_DIR"
     mkdir -p "$BACKUP_DIR"
@@ -284,6 +511,7 @@ _backup_worker() {
     local wings_was_running=false
     if systemctl is-active --quiet wings 2>/dev/null; then
         log STEP "Menghentikan Wings sementara selama proses backup..."
+        activity_log "BACKUP_PROGRESS" "Wings dihentikan sementara"
         systemctl stop wings 2>/dev/null \
             && wings_was_running=true && log INFO "Wings berhasil dihentikan." \
             || log WARN "Gagal menghentikan Wings — proses backup tetap dilanjutkan."
@@ -292,15 +520,20 @@ _backup_worker() {
     fi
 
     local t0=$SECONDS
+    activity_log "BACKUP_PROGRESS" "Kompresi dimulai..."
     smart_compress "/var/lib/pterodactyl" "volumes" "$tmpf"
     echo "" >> "$LOG_FILE"
     local elapsed=$(( SECONDS - t0 ))
     local fsize; fsize=$(du -sh "$tmpf" | awk '{print $1}')
     log INFO "Kompresi selesai: ${fsize} dalam ${elapsed} detik."
+    activity_log "BACKUP_PROGRESS" "Kompresi selesai: ${fsize} dalam ${elapsed}s"
 
     log STEP "Mengunggah ke Google Drive ($remote)..."
+    activity_log "BACKUP_PROGRESS" "Upload ke Google Drive dimulai..."
     rclone_retry copy "$tmpf" "$remote" \
-        || { log ERROR "Pengunggahan gagal."; exit 1; }
+        || { log ERROR "Pengunggahan gagal."; activity_log "BACKUP_FAIL" "Upload gagal setelah $MAX_RETRIES percobaan"; exit 1; }
+
+    activity_log "BACKUP_PROGRESS" "Upload selesai"
 
     mv "$tmpf" "$destf"
     log INFO "Backup disimpan lokal: $destf"
@@ -311,6 +544,7 @@ _backup_worker() {
         systemctl is-active --quiet wings 2>/dev/null \
             && log INFO "Wings kembali berjalan." \
             || log WARN "Wings gagal dijalankan — periksa dengan: systemctl status wings"
+        activity_log "BACKUP_PROGRESS" "Wings kembali dijalankan"
     fi
 
     log STEP "Menghapus backup lokal yang lebih lama dari ${RETENTION_DAYS} hari..."
@@ -330,6 +564,7 @@ _backup_worker() {
     log INFO "  Drive : $remote"
     log INFO "========================================"
     log INFO "BACKUP SELESAI: $fname ($fsize)"
+    activity_log "BACKUP_SUCCESS" "Backup selesai — File: $fname | Ukuran: $fsize | Durasi: ${elapsed}s"
 }
 
 # ─── PROSES BACKUP (dengan SIGHUP-proof background execution) ─
@@ -355,45 +590,53 @@ do_backup() {
     echo -e "\n${GREEN}${BOLD}[✓] Proses backup telah selesai. Cek log untuk detail: $LOG_FILE${NC}"
 }
 
-# ─── LOGIKA INTI RESTORE (dijalankan di background) ───────────
+# ─── LOGIKA INTI RESTORE (dijalankan di background) ──────────
 _restore_worker() {
     local rfile="$1"
     local remote="${REMOTE_NAME}:${GDRIVE_FOLDER}"
 
     log STEP "=== RESTORE WORKER DIMULAI (PID: $$) ==="
+    activity_log "RESTORE_START" "Restore dimulai — File: $rfile"
 
     mkdir -p "$TEMP_DIR"
     local local_file="$TEMP_DIR/$rfile"
 
     log STEP "Mengunduh file: $rfile dari $remote"
+    activity_log "RESTORE_PROGRESS" "Download file dari Google Drive..."
     rclone_retry copy --include "$rfile" "$remote" "$TEMP_DIR/" \
-        || { log ERROR "Pengunduhan gagal."; exit 1; }
+        || { log ERROR "Pengunduhan gagal."; activity_log "RESTORE_FAIL" "Download gagal"; exit 1; }
+
+    activity_log "RESTORE_PROGRESS" "Download selesai, memverifikasi integritas..."
 
     log STEP "Memverifikasi integritas arsip..."
     tar -tzf "$local_file" >/dev/null 2>&1 \
-        || { log ERROR "File backup rusak atau tidak dapat dibaca."; rm -f "$local_file"; exit 1; }
+        || { log ERROR "File backup rusak atau tidak dapat dibaca."; activity_log "RESTORE_FAIL" "File backup corrupt"; rm -f "$local_file"; exit 1; }
     log INFO "Integritas arsip terverifikasi."
 
     local wings_up=false
     if systemctl is-active --quiet wings 2>/dev/null; then
         log STEP "Menghentikan Wings..."
         systemctl stop wings && wings_up=true
+        activity_log "RESTORE_PROGRESS" "Wings dihentikan"
     fi
 
     local snap="/root/volumes_snapshot_$(date +%H%M%S)"
     if [ -d "$PTERO_PATH" ] && [ "$(ls -A "$PTERO_PATH" 2>/dev/null)" ]; then
         log STEP "Memindahkan data lama ke: $snap"
         mv "$PTERO_PATH" "$snap" 2>/dev/null || true
+        activity_log "RESTORE_PROGRESS" "Data lama dipindahkan ke $snap"
     fi
     mkdir -p "$PTERO_PATH"
 
     log STEP "Mengekstrak arsip backup..."
+    activity_log "RESTORE_PROGRESS" "Ekstraksi dimulai..."
     tar -xzf "$local_file" \
         --checkpoint=500 \
         --checkpoint-action=dot \
         -C /var/lib/pterodactyl 2>/dev/null
     echo "" >> "$LOG_FILE"
     log INFO "Ekstraksi selesai."
+    activity_log "RESTORE_PROGRESS" "Ekstraksi selesai"
 
     log STEP "Memperbaiki izin akses direktori..."
     local ptero_uid; ptero_uid=$(id -u pterodactyl 2>/dev/null || echo "988")
@@ -406,6 +649,7 @@ _restore_worker() {
         systemctl is-active --quiet wings \
             && log INFO "Wings kembali berjalan." \
             || log WARN "Wings gagal dijalankan — periksa dengan: systemctl status wings"
+        activity_log "RESTORE_PROGRESS" "Wings kembali dijalankan"
     fi
 
     rm -f "$local_file"
@@ -416,6 +660,7 @@ _restore_worker() {
     log INFO "  Snapshot : $snap"
     log INFO "========================================"
     log INFO "RESTORE SELESAI: $rfile"
+    activity_log "RESTORE_SUCCESS" "Restore selesai — File: $rfile | Snapshot lama: $snap"
 }
 
 # ─── PROSES RESTORE (dengan SIGHUP-proof background execution) ─
@@ -570,6 +815,9 @@ except Exception as e:
     if [ "${opt:-}" == "6" ]; then
         crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab - 2>/dev/null || true
         log INFO "Jadwal backup otomatis berhasil dihapus."
+        activity_log "CRON_DELETE" "Jadwal backup otomatis dihapus"
+    else
+        activity_log "CRON_SETUP" "Jadwal backup diatur: setiap ${interval_days} hari pukul ${wib_time} WIB"
     fi
 }
 
@@ -600,6 +848,17 @@ show_status() {
         disk=$(df -h "$PTERO_PATH" 2>/dev/null | awk 'NR==2{printf "%s terpakai / %s total (%s)", $3,$2,$5}') || disk="(tidak dapat dibaca)"
         echo -e "  Disk         : ${BOLD}$disk${NC}"
     } || echo -e "  Disk         : ${YELLOW}${BOLD}PEMERIKSAAN GAGAL${NC}"
+
+    # Swap info
+    {
+        local swap_info
+        swap_info=$(free -h | awk '/^Swap:/{printf "%s terpakai / %s total", $3, $2}')
+        if [ "$(free | awk '/^Swap:/{print $2}')" -gt 0 ] 2>/dev/null; then
+            echo -e "  Swap         : ${GREEN}${BOLD}AKTIF${NC} ($swap_info) | swappiness=$(cat /proc/sys/vm/swappiness)"
+        else
+            echo -e "  Swap         : ${YELLOW}${BOLD}TIDAK AKTIF${NC}"
+        fi
+    } || echo -e "  Swap         : ${YELLOW}${BOLD}PEMERIKSAAN GAGAL${NC}"
 
     {
         systemctl is-active --quiet wings 2>/dev/null \
@@ -650,7 +909,8 @@ show_banner() {
     echo -e "║   👑  BIMXYZ ULTIMATE BACKUP SYSTEM V${VERSION}       ║"
     echo -e "║        Enterprise Grade | Multi-Server Deploy     ║"
     echo -e "╚══════════════════════════════════════════════════╝${NC}"
-    echo -e "  ${YELLOW}Log: $LOG_FILE${NC}\n"
+    echo -e "  ${YELLOW}Log: $LOG_FILE${NC}"
+    echo -e "  ${YELLOW}Activity: $ACTIVITY_LOG${NC}\n"
 }
 
 # ─── MENU UTAMA ───────────────────────────────────────────────
@@ -662,9 +922,11 @@ show_menu() {
     echo -e "  ${BOLD}4.${NC} 🖥️  Atur / Ubah Nama Node Server"
     echo -e "  ${BOLD}5.${NC} 📊 Lihat Status Sistem"
     echo -e "  ${BOLD}6.${NC} 🔄 Reset Autentikasi Google Drive"
-    echo -e "  ${BOLD}7.${NC} 🚪 Keluar"
+    echo -e "  ${BOLD}7.${NC} 💾 Smart Swap & Kernel Optimization"
+    echo -e "  ${BOLD}8.${NC} 📋 Log Aktivitas"
+    echo -e "  ${BOLD}9.${NC} 🚪 Keluar"
     echo ""
-    read -rp "Pilihan (1-7): " choice
+    read -rp "Pilihan (1-9): " choice
 
     case "$choice" in
         1) do_backup ;;
@@ -676,8 +938,11 @@ show_menu() {
             rclone config delete "$REMOTE_NAME" 2>/dev/null || true
             rm -f "$CONFIG_DIR/service_account.json"
             log INFO "Autentikasi berhasil direset. Jalankan skrip kembali untuk mengonfigurasi ulang."
+            activity_log "GDRIVE_RESET" "Autentikasi Google Drive direset"
             ;;
-        7) exit 0 ;;
+        7) setup_smart_swap ;;
+        8) view_activity_log ;;
+        9) exit 0 ;;
         *) log ERROR "Pilihan tidak valid." ;;
     esac
 }
@@ -687,9 +952,11 @@ main() {
     check_root
     mkdir -p "$CONFIG_DIR" "$BACKUP_DIR"
     touch "$LOG_FILE"
+    touch "$ACTIVITY_LOG"
 
     if [ "${1:-}" == "--auto-backup" ]; then
         log INFO "=== BACKUP OTOMATIS DIMULAI (CRON) ==="
+        activity_log "AUTO_BACKUP" "Backup otomatis dipicu oleh cron"
         install_deps
         setup_gdrive
         _backup_worker
