@@ -408,13 +408,19 @@ _backup_worker() {
 
     log STEP "Menyalin data ke staging (rsync, snapshot konsisten tanpa menghentikan Wings)..."
     mkdir -p "$staging/volumes"
-    local rsync_err
+    local rsync_err rsync_rc
     rsync_err=$(run_limited rsync -a --delete "$PTERO_PATH/" "$staging/volumes/" 2>&1 >/dev/null)
-    if [ $? -ne 0 ]; then
-        log ERROR "Gagal menyalin data ke staging. Detail: $rsync_err"
+    rsync_rc=$?
+    # Kode 24 = "file vanished" (file dihapus/berubah saat sedang dibaca).
+    # Ini wajar terjadi karena Wings tetap berjalan dan file sesi (mis. pre-key
+    # WhatsApp) memang sering dibuat lalu dihapus dalam hitungan detik.
+    # Bukan kegagalan — file tersebut cukup dilewati.
+    if [ "$rsync_rc" -ne 0 ] && [ "$rsync_rc" -ne 24 ]; then
+        log ERROR "Gagal menyalin data ke staging (kode: $rsync_rc). Detail: $rsync_err"
         rm -rf "$staging"
         exit 1
     fi
+    [ "$rsync_rc" -eq 24 ] && log WARN "Beberapa file sesi berubah/terhapus saat staging (wajar, dilewati) — tidak memengaruhi hasil backup."
     log INFO "Staging selesai."
 
     local t0=$SECONDS
@@ -469,7 +475,11 @@ do_backup() {
     echo -e "${YELLOW}[»] Tekan Ctrl+C kapan saja untuk berhenti memantau —${NC}"
     echo -e "${YELLOW}    proses backup TETAP berjalan di background.${NC}\n"
 
-    nohup bash "$SCRIPT_PATH" --run-worker-backup >> "$LOG_FILE" 2>&1 &
+    if command -v setsid &>/dev/null; then
+        setsid nohup bash "$SCRIPT_PATH" --run-worker-backup >> "$LOG_FILE" 2>&1 < /dev/null &
+    else
+        nohup bash "$SCRIPT_PATH" --run-worker-backup >> "$LOG_FILE" 2>&1 &
+    fi
     local bg_pid=$!
     disown "$bg_pid"
 
@@ -600,7 +610,11 @@ do_restore() {
     echo -e "${YELLOW}[»] Tekan Ctrl+C kapan saja untuk berhenti memantau —${NC}"
     echo -e "${YELLOW}    proses restore TETAP berjalan di background.${NC}\n"
 
-    nohup bash "$SCRIPT_PATH" --run-worker-restore "$rfile" >> "$LOG_FILE" 2>&1 &
+    if command -v setsid &>/dev/null; then
+        setsid nohup bash "$SCRIPT_PATH" --run-worker-restore "$rfile" >> "$LOG_FILE" 2>&1 < /dev/null &
+    else
+        nohup bash "$SCRIPT_PATH" --run-worker-restore "$rfile" >> "$LOG_FILE" 2>&1 &
+    fi
     local bg_pid=$!
     disown "$bg_pid"
 
