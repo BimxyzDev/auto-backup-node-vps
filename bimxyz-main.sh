@@ -84,6 +84,7 @@ install_deps() {
     command -v rclone  &>/dev/null || missing+=("rclone")
     command -v curl    &>/dev/null || missing+=("curl")
     command -v python3 &>/dev/null || missing+=("python3")
+    command -v rsync   &>/dev/null || missing+=("rsync")
 
     [ ${#missing[@]} -eq 0 ] && return 0
 
@@ -328,9 +329,10 @@ check_disk_space() {
     local src="$1"
     local src_mb; src_mb=$(du -sm "$src" 2>/dev/null | awk '{print $1}')
     local free_mb; free_mb=$(df -m "$TEMP_DIR" | awk 'NR==2{print $4}')
-    local need_mb=$(( src_mb + 512 ))
+    # Staging (rsync, ~1x ukuran sumber) + hasil kompresi (diasumsikan konservatif ~1x) + buffer
+    local need_mb=$(( (src_mb * 2) + 512 ))
 
-    log STEP "Ukuran sumber: ${src_mb}MB | Ruang tersedia: ${free_mb}MB | Diperlukan: ${need_mb}MB"
+    log STEP "Ukuran sumber: ${src_mb}MB | Ruang tersedia: ${free_mb}MB | Diperlukan (staging+arsip): ${need_mb}MB"
     [ "$free_mb" -ge "$need_mb" ] && return 0
 
     log ERROR "Ruang disk tidak mencukupi. Tersedia: ${free_mb}MB, Diperlukan: ${need_mb}MB."
@@ -385,6 +387,7 @@ _backup_worker() {
     local tmpf="$TEMP_DIR/$fname"
     local destf="$BACKUP_DIR/$fname"
     local remote="${REMOTE_NAME}:${GDRIVE_FOLDER}"
+    local staging="$TEMP_DIR/staging_${stamp}"
 
     log STEP "=== BACKUP WORKER DIMULAI (PID: $$) ==="
     log STEP "Node: $node | Nama file: $fname"
@@ -396,23 +399,22 @@ _backup_worker() {
     ensure_gdrive_folder || exit 1
 
     log STEP "Tujuan remote: $remote"
+    log INFO "Wings tetap berjalan selama proses backup (tidak dihentikan)."
 
-    local wings_was_running=false
-    if systemctl is-active --quiet wings 2>/dev/null; then
-        log STEP "Menghentikan Wings sementara selama proses backup..."
-        systemctl stop wings 2>/dev/null \
-            && wings_was_running=true && log INFO "Wings berhasil dihentikan." \
-            || log WARN "Gagal menghentikan Wings — proses backup tetap dilanjutkan."
-    else
-        log INFO "Wings tidak aktif — melanjutkan proses backup."
-    fi
+    log STEP "Menyalin data ke staging (rsync, snapshot konsisten tanpa menghentikan Wings)..."
+    mkdir -p "$staging/volumes"
+    run_limited rsync -a --delete "$PTERO_PATH/" "$staging/volumes/" 2>/dev/null \
+        || { log ERROR "Gagal menyalin data ke staging."; rm -rf "$staging"; exit 1; }
+    log INFO "Staging selesai."
 
     local t0=$SECONDS
-    smart_compress "$PTERO_BASE" "$(basename "$PTERO_PATH")" "$tmpf"
+    smart_compress "$staging" "volumes" "$tmpf"
     echo "" >> "$LOG_FILE"
     local elapsed=$(( SECONDS - t0 ))
     local fsize; fsize=$(du -sh "$tmpf" | awk '{print $1}')
     log INFO "Kompresi selesai: ${fsize} dalam ${elapsed} detik."
+
+    rm -rf "$staging"
 
     log STEP "Mengunggah ke Google Drive ($remote)..."
     rclone_retry copy "$tmpf" "$remote" \
@@ -420,14 +422,6 @@ _backup_worker() {
 
     mv "$tmpf" "$destf"
     log INFO "Backup disimpan lokal: $destf"
-
-    if $wings_was_running; then
-        log STEP "Menjalankan kembali Wings..."
-        systemctl start wings 2>/dev/null && sleep 3
-        systemctl is-active --quiet wings 2>/dev/null \
-            && log INFO "Wings kembali berjalan." \
-            || log WARN "Wings gagal dijalankan — periksa dengan: systemctl status wings"
-    fi
 
     log STEP "Menghapus backup lokal yang lebih lama dari ${RETENTION_DAYS} hari..."
     find "$BACKUP_DIR" -maxdepth 1 -name "${node}_*.tar.gz" -mtime +${RETENTION_DAYS} -delete 2>/dev/null || true

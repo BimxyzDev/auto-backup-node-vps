@@ -30,7 +30,7 @@ Skrip ini dirancang agar **ringan** — proses backup dibatasi maksimum **0.5 vC
 - 💾 **Manajemen Swap & Kernel** — tambah, ubah ukuran, atau hapus swap file, plus optimasi `vm.swappiness` dan `vm.vfs_cache_pressure` untuk node dengan RAM terbatas
 - 📊 **Dashboard status sistem** — cek koneksi Google Drive, penggunaan disk, status swap, status Wings, dan jadwal cron dalam satu tampilan
 - 🔁 **Auto-retry & self-healing** — otomatis mencoba ulang saat upload/download gagal, dan memperbaiki konfigurasi rclone yang rusak tanpa perlu setup ulang manual
-- 🛡️ **Aman untuk Wings** — layanan Wings dihentikan sementara saat backup/restore berjalan (jika sedang aktif) dan dijalankan kembali otomatis setelah selesai
+- 🛡️ **Wings tetap berjalan saat backup** — data disalin dulu ke staging via `rsync` (snapshot konsisten) sehingga server-server yang sedang online tidak perlu dihentikan. Wings hanya dihentikan sementara saat **restore** (karena folder volume ditimpa langsung), lalu dijalankan kembali otomatis setelah selesai
 
 ## Kebutuhan Sistem
 
@@ -124,10 +124,10 @@ Uninstaller akan menghentikan proses yang berjalan, menghapus konfigurasi, jadwa
 ## FAQ
 
 **Apakah proses backup akan mengganggu server yang sedang online di node?**
-Tidak. Proses kompresi dan upload dibatasi maksimum 0.5 vCPU dan 300MB RAM menggunakan cgroup, sehingga server-server Pterodactyl lain di node yang sama tetap mendapat jatah resource yang cukup.
+Tidak. Wings tetap berjalan penuh selama backup (data disalin lewat `rsync` ke staging, bukan langsung dari folder live), dan seluruh proses kompresi, penyalinan, serta upload dibatasi maksimum 0.5 vCPU dan 300MB RAM plus prioritas I/O disk terendah menggunakan cgroup — sehingga server-server Pterodactyl lain di node yang sama tetap mendapat jatah resource yang cukup.
 
 **Apakah Wings perlu dimatikan manual sebelum backup?**
-Tidak perlu. Skrip otomatis menghentikan Wings sementara (jika sedang berjalan) sebelum proses backup/restore, dan menjalankannya kembali setelah selesai.
+Tidak. Saat **backup**, Wings tetap berjalan penuh — skrip menyalin data ke staging memakai `rsync` (snapshot konsisten) sebelum dikompres, jadi server-server yang sedang online tidak terganggu. Saat **restore**, Wings dihentikan sementara secara otomatis (karena folder volume ditimpa langsung) dan dijalankan kembali setelah selesai.
 
 **Berapa lama backup disimpan?**
 Di Google Drive, hanya backup **terbaru** per node yang disimpan (backup lama otomatis dihapus setelah upload baru berhasil). Secara lokal, backup disimpan selama 3 hari sebagai cadangan darurat.
