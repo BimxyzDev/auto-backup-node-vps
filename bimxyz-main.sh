@@ -83,7 +83,6 @@ install_deps() {
     command -v rclone  &>/dev/null || missing+=("rclone")
     command -v curl    &>/dev/null || missing+=("curl")
     command -v python3 &>/dev/null || missing+=("python3")
-    command -v rsync   &>/dev/null || missing+=("rsync")
 
     [ ${#missing[@]} -eq 0 ] && return 0
 
@@ -334,10 +333,12 @@ check_disk_space() {
     local src="$1"
     local src_mb; src_mb=$(du -sm "$src" 2>/dev/null | awk '{print $1}')
     local free_mb; free_mb=$(df -m "$TEMP_DIR" | awk 'NR==2{print $4}')
-    # Staging (rsync, ~1x ukuran sumber) + hasil kompresi (diasumsikan konservatif ~1x) + buffer
-    local need_mb=$(( (src_mb * 2) + 512 ))
+    # Kompresi langsung dari folder live (tanpa staging) — cukup perkirakan
+    # ruang untuk hasil arsip. Diasumsikan konservatif setengah dari ukuran
+    # sumber (data JSON/text biasanya terkompres jauh lebih kecil) + buffer.
+    local need_mb=$(( (src_mb / 2) + 512 ))
 
-    log STEP "Ukuran sumber: ${src_mb}MB | Ruang tersedia: ${free_mb}MB | Diperlukan (staging+arsip): ${need_mb}MB"
+    log STEP "Ukuran sumber: ${src_mb}MB | Ruang tersedia: ${free_mb}MB | Diperlukan (perkiraan arsip): ${need_mb}MB"
     [ "$free_mb" -ge "$need_mb" ] && return 0
 
     log ERROR "Ruang disk tidak mencukupi. Tersedia: ${free_mb}MB, Diperlukan: ${need_mb}MB."
@@ -368,20 +369,37 @@ rclone_retry() {
 # ─── KOMPRESI CERDAS ──────────────────────────────────────────
 smart_compress() {
     local src_dir="$1" src_name="$2" dest="$3"
+    local tar_err tar_rc
 
     # CPU sudah dibatasi oleh cgroup (run_limited), jadi cukup 1 thread pigz
     # agar tidak ada overhead context-switch sia-sia di dalam jatah CPU yang kecil.
+    # --ignore-failed-read + exit code 1 ditoleransi: karena dibaca langsung dari
+    # folder live (Wings tetap berjalan), file sesi kecil (mis. pre-key WhatsApp)
+    # wajar berubah/terhapus saat sedang dibaca. Itu bukan kegagalan backup.
     if command -v pigz &>/dev/null; then
         log STEP "Kompresi menggunakan pigz (dibatasi ${LIMIT_CPU_QUOTA} CPU / ${LIMIT_MEM_MAX} RAM)..."
-        run_limited tar --use-compress-program="pigz -p 1" \
+        tar_err=$(run_limited tar --use-compress-program="pigz -p 1" \
+            --ignore-failed-read --warning=no-file-changed --warning=no-file-removed \
             -f "$dest" --checkpoint=500 --checkpoint-action=dot \
-            -c -C "$src_dir" "$src_name" 2>/dev/null
+            -c -C "$src_dir" "$src_name" 2>&1 >/dev/null)
+        tar_rc=$?
     else
         log STEP "Kompresi menggunakan gzip standar (dibatasi ${LIMIT_CPU_QUOTA} CPU / ${LIMIT_MEM_MAX} RAM)..."
-        run_limited tar -czf "$dest" \
+        tar_err=$(run_limited tar -czf "$dest" \
+            --ignore-failed-read --warning=no-file-changed --warning=no-file-removed \
             --checkpoint=500 --checkpoint-action=dot \
-            -C "$src_dir" "$src_name" 2>/dev/null
+            -C "$src_dir" "$src_name" 2>&1 >/dev/null)
+        tar_rc=$?
     fi
+
+    # Kode 1 = beberapa file berubah/hilang saat dibaca (wajar, arsip tetap valid).
+    # Kode lain = kegagalan nyata (disk penuh, permission, dsb).
+    if [ "$tar_rc" -ne 0 ] && [ "$tar_rc" -ne 1 ]; then
+        log ERROR "Kompresi gagal (kode: $tar_rc). Detail: $tar_err"
+        return 1
+    fi
+    [ "$tar_rc" -eq 1 ] && log WARN "Beberapa file sesi berubah/terhapus saat kompresi (wajar, dilewati) — arsip tetap valid."
+    return 0
 }
 
 # ─── LOGIKA INTI BACKUP (dijalankan di background) ────────────
@@ -392,7 +410,6 @@ _backup_worker() {
     local tmpf="$TEMP_DIR/$fname"
     local destf="$BACKUP_DIR/$fname"
     local remote="${REMOTE_NAME}:${GDRIVE_FOLDER}"
-    local staging="$TEMP_DIR/staging_${stamp}"
 
     log STEP "=== BACKUP WORKER DIMULAI (PID: $$) ==="
     log STEP "Node: $node | Nama file: $fname"
@@ -406,31 +423,12 @@ _backup_worker() {
     log STEP "Tujuan remote: $remote"
     log INFO "Wings tetap berjalan selama proses backup (tidak dihentikan)."
 
-    log STEP "Menyalin data ke staging (rsync, snapshot konsisten tanpa menghentikan Wings)..."
-    mkdir -p "$staging/volumes"
-    local rsync_err rsync_rc
-    rsync_err=$(run_limited rsync -a --delete "$PTERO_PATH/" "$staging/volumes/" 2>&1 >/dev/null)
-    rsync_rc=$?
-    # Kode 24 = "file vanished" (file dihapus/berubah saat sedang dibaca).
-    # Ini wajar terjadi karena Wings tetap berjalan dan file sesi (mis. pre-key
-    # WhatsApp) memang sering dibuat lalu dihapus dalam hitungan detik.
-    # Bukan kegagalan — file tersebut cukup dilewati.
-    if [ "$rsync_rc" -ne 0 ] && [ "$rsync_rc" -ne 24 ]; then
-        log ERROR "Gagal menyalin data ke staging (kode: $rsync_rc). Detail: $rsync_err"
-        rm -rf "$staging"
-        exit 1
-    fi
-    [ "$rsync_rc" -eq 24 ] && log WARN "Beberapa file sesi berubah/terhapus saat staging (wajar, dilewati) — tidak memengaruhi hasil backup."
-    log INFO "Staging selesai."
-
     local t0=$SECONDS
-    smart_compress "$staging" "volumes" "$tmpf"
+    smart_compress "$PTERO_BASE" "$(basename "$PTERO_PATH")" "$tmpf" || exit 1
     echo "" >> "$LOG_FILE"
     local elapsed=$(( SECONDS - t0 ))
     local fsize; fsize=$(du -sh "$tmpf" | awk '{print $1}')
     log INFO "Kompresi selesai: ${fsize} dalam ${elapsed} detik."
-
-    rm -rf "$staging"
 
     log STEP "Mengunggah ke Google Drive ($remote)..."
     rclone_retry copy "$tmpf" "$remote" \
