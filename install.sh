@@ -85,13 +85,12 @@ case "$choice" in
         echo -e "${YELLOW}[*] Menghapus jadwal Auto-Backup dari Cron...${NC}"
         crontab -l 2>/dev/null | grep -v "bimxyz" | crontab - 2>/dev/null || true
 
-        echo -e "${YELLOW}[*] Menghapus tools dependensi (bc & rclone)...${NC}"
-        # Hapus bc via apt, error di-ignore jika paket tidak ada
-        DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y bc >/dev/null 2>&1 || true
-        # Hapus rclone binary
+        echo -e "${YELLOW}[*] Menghapus tools dependensi (rclone)...${NC}"
         rm -f /usr/bin/rclone /usr/local/bin/rclone /usr/share/man/man1/rclone.1 /usr/local/share/man/man1/rclone.1
 
-        echo -e "${GREEN}✅ Uninstalasi berhasil! Server telah bersih dari Bimxyz Auto-Backup beserta tools-nya.${NC}\n"
+        echo -e "${GREEN}✅ Uninstalasi berhasil! Server telah bersih dari Bimxyz Auto-Backup beserta tools-nya.${NC}"
+        echo -e "${YELLOW}[i] Catatan: /swapfile (jika pernah dibuat lewat menu Manajemen Swap) TIDAK dihapus otomatis.${NC}"
+        echo -e "${YELLOW}    Hapus manual jika perlu: swapoff /swapfile && rm -f /swapfile${NC}\n"
         ;;
         
     3)
