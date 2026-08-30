@@ -25,7 +25,7 @@ Skrip ini dirancang agar **ringan** — proses backup dibatasi maksimum **0.5 vC
 - 🚀 **Backup manual & otomatis** — jalankan kapan saja, atau jadwalkan lewat cron (per jam maupun per hari)
 - 📥 **Restore satu klik** — pilih backup dari daftar yang tersedia di Google Drive, sistem otomatis mem-verifikasi integritas arsip sebelum menimpa data
 - ☁️ **Integrasi Google Drive via rclone** — autentikasi menggunakan Service Account (aman untuk multi-server, tidak perlu login interaktif berulang)
-- 🧹 **Retensi otomatis** — backup lama di Google Drive langsung dihapus setelah backup baru berhasil diunggah, jadi kuota Drive tidak membengkak; backup lokal disimpan sebagai cadangan selama 7 hari
+- 🧹 **Retensi otomatis** — backup lama di Google Drive langsung dihapus setelah backup baru berhasil diunggah, jadi kuota Drive tidak membengkak; backup lokal disimpan sebagai cadangan selama 3 hari
 - 🐢 **Pembatasan resource (CPU & RAM)** — seluruh proses backup dijalankan di dalam cgroup yang dibatasi ketat, tidak mengganggu server game/bot yang sedang online
 - 💾 **Manajemen Swap & Kernel** — tambah, ubah ukuran, atau hapus swap file, plus optimasi `vm.swappiness` dan `vm.vfs_cache_pressure` untuk node dengan RAM terbatas
 - 📊 **Dashboard status sistem** — cek koneksi Google Drive, penggunaan disk, status swap, status Wings, dan jadwal cron dalam satu tampilan
@@ -117,7 +117,7 @@ Uninstaller akan menghentikan proses yang berjalan, menghapus konfigurasi, jadwa
 |---|---|
 | `/usr/local/bin/bimxyz` | Skrip utama setelah terinstal |
 | `/root/.bimxyz/` | Konfigurasi (Service Account JSON, nama node) |
-| `/root/bimxyz_backup/` | Penyimpanan backup lokal (retensi 7 hari) |
+| `/root/bimxyz_backup/` | Penyimpanan backup lokal (retensi 3 hari) |
 | `/var/log/bimxyz_backup.log` | Log seluruh proses backup/restore |
 | `/root/volumes_snapshot_*` | Snapshot data lama sebelum proses restore |
 
@@ -130,7 +130,7 @@ Tidak. Proses kompresi dan upload dibatasi maksimum 0.5 vCPU dan 300MB RAM mengg
 Tidak perlu. Skrip otomatis menghentikan Wings sementara (jika sedang berjalan) sebelum proses backup/restore, dan menjalankannya kembali setelah selesai.
 
 **Berapa lama backup disimpan?**
-Di Google Drive, hanya backup **terbaru** per node yang disimpan (backup lama otomatis dihapus setelah upload baru berhasil). Secara lokal, backup disimpan selama 7 hari sebagai cadangan darurat.
+Di Google Drive, hanya backup **terbaru** per node yang disimpan (backup lama otomatis dihapus setelah upload baru berhasil). Secara lokal, backup disimpan selama 3 hari sebagai cadangan darurat.
 
 **Bagaimana jika koneksi ke Google Drive terputus saat upload?**
 Skrip otomatis mencoba ulang hingga 3 kali dengan jeda 15 detik. Jika tetap gagal, backup lokal tetap tersimpan dan tercatat di log.

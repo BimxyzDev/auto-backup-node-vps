@@ -16,7 +16,7 @@ readonly NODE_CONFIG="$CONFIG_DIR/node.conf"
 readonly LOG_FILE="/var/log/bimxyz_backup.log"
 readonly SCRIPT_PATH="$(readlink -f "$0")"
 readonly MAX_RETRIES=3
-readonly RETENTION_DAYS=7
+readonly RETENTION_DAYS=3
 readonly LIMIT_CPU_QUOTA="50%"
 readonly LIMIT_MEM_MAX="300M"
 
@@ -63,6 +63,8 @@ run_limited() {
             -p CPUQuota="$LIMIT_CPU_QUOTA" \
             -p MemoryMax="$LIMIT_MEM_MAX" \
             -p MemorySwapMax=0 \
+            -p IOWeight=10 \
+            -p OOMPolicy=continue \
             -- "$@"
         return $?
     fi
