@@ -233,20 +233,34 @@ _optimize_kernel() {
 # ─── PERBAIKAN OTOMATIS KONFIGURASI RCLONE ────────────────────
 auto_repair_rclone_config() {
     local sa_file="$CONFIG_DIR/service_account.json"
+    local token_file="$CONFIG_DIR/oauth_token.json"
 
     rclone listremotes 2>/dev/null | grep -q "^${REMOTE_NAME}:$" && return 0
-    [ -f "$sa_file" ] || return 1
 
-    log WARN "Remote '$REMOTE_NAME' tidak ditemukan — menjalankan perbaikan otomatis..."
+    if [ -f "$sa_file" ]; then
+        log WARN "Remote '$REMOTE_NAME' tidak ditemukan — menjalankan perbaikan otomatis (Service Account)..."
+        python3 -c "import json,sys; json.load(open('$sa_file'))" 2>/dev/null \
+            || { log ERROR "File service_account.json tidak valid — perbaikan dibatalkan."; return 1; }
 
-    python3 -c "import json,sys; json.load(open('$sa_file'))" 2>/dev/null \
-        || { log ERROR "File service_account.json tidak valid — perbaikan dibatalkan."; return 1; }
+        rclone config create "$REMOTE_NAME" drive \
+            service_account_file="$sa_file" \
+            scope=drive \
+            --non-interactive >/dev/null 2>&1 \
+            || { log ERROR "Perbaikan otomatis gagal membuat remote."; return 1; }
+    elif [ -f "$token_file" ]; then
+        log WARN "Remote '$REMOTE_NAME' tidak ditemukan — menjalankan perbaikan otomatis (OAuth)..."
+        python3 -c "import json,sys; json.load(open('$token_file'))" 2>/dev/null \
+            || { log ERROR "File oauth_token.json tidak valid — perbaikan dibatalkan."; return 1; }
 
-    rclone config create "$REMOTE_NAME" drive \
-        service_account_file="$sa_file" \
-        scope=drive \
-        --non-interactive >/dev/null 2>&1 \
-        || { log ERROR "Perbaikan otomatis gagal membuat remote."; return 1; }
+        local token_content; token_content=$(cat "$token_file")
+        rclone config create "$REMOTE_NAME" drive \
+            scope=drive \
+            token="$token_content" \
+            --non-interactive >/dev/null 2>&1 \
+            || { log ERROR "Perbaikan otomatis gagal membuat remote."; return 1; }
+    else
+        return 1
+    fi
 
     log INFO "Perbaikan otomatis konfigurasi rclone berhasil."
 }
@@ -281,15 +295,30 @@ setup_gdrive() {
     fi
 
     rclone config delete "$REMOTE_NAME" 2>/dev/null || true
-    setup_service_account
+
+    echo -e "\n${CYAN}${BOLD}═══════ PENGATURAN GOOGLE DRIVE ═══════${NC}"
+    echo -e "  ${BOLD}1.${NC} Service Account JSON ${YELLOW}[Hanya untuk Shared Drive / Google Workspace]${NC}"
+    echo -e "  ${BOLD}2.${NC} OAuth (Akun Google pribadi) ${GREEN}[Untuk Gmail biasa — direkomendasikan]${NC}"
+    echo ""
+    read -rp "Pilihan (1/2): " gdrive_auth_choice
+
+    case "$gdrive_auth_choice" in
+        1) setup_service_account ;;
+        2) setup_oauth ;;
+        *) log ERROR "Pilihan tidak valid."; exit 1 ;;
+    esac
 }
 
 setup_service_account() {
     echo -e "\n${CYAN}${BOLD}═══════ PENGATURAN GOOGLE DRIVE (SERVICE ACCOUNT) ═══════${NC}"
+    echo -e "  ${RED}Catatan: Service Account TIDAK memiliki kuota penyimpanan sendiri.${NC}"
+    echo -e "  ${RED}Hanya bisa dipakai jika folder tujuan berada di SHARED DRIVE${NC}"
+    echo -e "  ${RED}(butuh akun Google Workspace) — bukan folder biasa di Gmail pribadi.${NC}"
+    echo ""
     echo -e "  1. Buka ${YELLOW}https://console.cloud.google.com/${NC}"
     echo -e "  2. Navigasi ke IAM & Admin → Service Accounts → Create"
     echo -e "  3. Pilih Keys → Add Key → JSON → Download"
-    echo -e "  4. Bagikan folder Google Drive ke alamat email service account tersebut"
+    echo -e "  4. Bagikan Shared Drive ke alamat email service account tersebut"
     echo -e "\n${YELLOW}Tempel isi file JSON di bawah ini, lalu tekan CTRL+D:${NC}"
 
     mkdir -p "$CONFIG_DIR"
@@ -306,8 +335,36 @@ setup_service_account() {
         --non-interactive >/dev/null 2>&1
 
     gdrive_is_alive \
-        || { log ERROR "Koneksi gagal — periksa izin akses service account."; exit 1; }
+        || { log ERROR "Koneksi gagal — periksa izin akses service account & pastikan folder ada di Shared Drive."; exit 1; }
     log INFO "Service Account berhasil dikonfigurasi."
+}
+
+setup_oauth() {
+    echo -e "\n${CYAN}${BOLD}═══════ PENGATURAN GOOGLE DRIVE (OAUTH) ═══════${NC}"
+    echo -e "  Gunakan ini jika folder backup ada di akun Google pribadi (Gmail biasa)."
+    echo -e "  Cara mendapatkan token, jalankan di perangkat lain yang ada browser:"
+    echo -e "  ${YELLOW}rclone authorize \"drive\"${NC}"
+    echo -e "  Login dengan akun Google tujuan, lalu salin JSON token yang muncul."
+    echo -e "\n${YELLOW}Tempel isi JSON token di bawah ini, lalu tekan CTRL+D:${NC}"
+
+    mkdir -p "$CONFIG_DIR"
+    local token_file="$CONFIG_DIR/oauth_token.json"
+    cat > "$token_file"
+
+    python3 -c "import json,sys; json.load(open('$token_file'))" 2>/dev/null \
+        || { log ERROR "Format JSON tidak valid."; rm -f "$token_file"; exit 1; }
+    chmod 600 "$token_file"
+
+    local token_content; token_content=$(cat "$token_file")
+
+    rclone config create "$REMOTE_NAME" drive \
+        scope=drive \
+        token="$token_content" \
+        --non-interactive >/dev/null 2>&1
+
+    gdrive_is_alive \
+        || { log ERROR "Koneksi gagal — token mungkin tidak valid atau sudah kedaluwarsa (buat ulang dengan 'rclone authorize \"drive\"')."; rm -f "$token_file"; exit 1; }
+    log INFO "OAuth berhasil dikonfigurasi."
 }
 
 # ─── MANAJEMEN NAMA NODE ──────────────────────────────────────
@@ -888,7 +945,7 @@ show_menu() {
         5) show_status ;;
         6)
             rclone config delete "$REMOTE_NAME" 2>/dev/null || true
-            rm -f "$CONFIG_DIR/service_account.json"
+            rm -f "$CONFIG_DIR/service_account.json" "$CONFIG_DIR/oauth_token.json"
             log INFO "Autentikasi berhasil direset. Jalankan skrip kembali untuk mengonfigurasi ulang."
             ;;
         7) setup_smart_swap ;;

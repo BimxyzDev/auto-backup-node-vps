@@ -24,7 +24,7 @@ Skrip ini dirancang agar **ringan** — proses backup dibatasi maksimum **1.5 vC
 
 - 🚀 **Backup manual & otomatis** — jalankan kapan saja, atau jadwalkan lewat cron (per jam maupun per hari)
 - 📥 **Restore satu klik** — pilih backup dari daftar yang tersedia di Google Drive, sistem otomatis mem-verifikasi integritas arsip sebelum menimpa data
-- ☁️ **Integrasi Google Drive via rclone** — autentikasi menggunakan Service Account (aman untuk multi-server, tidak perlu login interaktif berulang)
+- ☁️ **Integrasi Google Drive via rclone** — mendukung dua metode autentikasi: **OAuth** (untuk Gmail pribadi — direkomendasikan bagi kebanyakan pengguna) dan **Service Account** (khusus Shared Drive / Google Workspace, karena Service Account tidak memiliki kuota penyimpanan sendiri di Drive biasa)
 - 🧹 **Retensi otomatis** — backup lama di Google Drive langsung dihapus setelah backup baru berhasil diunggah, jadi kuota Drive tidak membengkak; backup lokal disimpan sebagai cadangan selama 3 hari
 - 🐢 **Pembatasan resource (CPU & RAM)** — seluruh proses backup dijalankan di dalam cgroup yang dibatasi ketat, tidak mengganggu server game/bot yang sedang online
 - 💾 **Manajemen Swap & Kernel** — tambah, ubah ukuran, atau hapus swap file, plus optimasi `vm.swappiness` dan `vm.vfs_cache_pressure` untuk node dengan RAM terbatas
@@ -37,7 +37,7 @@ Skrip ini dirancang agar **ringan** — proses backup dibatasi maksimum **1.5 vC
 - VPS/dedicated server berbasis **Ubuntu/Debian** dengan akses root
 - **systemd** terpasang (untuk pembatasan resource via cgroup; skrip tetap berjalan tanpanya lewat mode fallback, namun batas RAM jadi kurang presisi)
 - Node **Pterodactyl (Wings)** dengan direktori volume di `/var/lib/pterodactyl/volumes`
-- Akun Google Drive + **Service Account JSON** (panduan pembuatan ada di dalam skrip saat instalasi)
+- Akun Google Drive — **OAuth** untuk Gmail pribadi (direkomendasikan), atau **Service Account JSON + Shared Drive** untuk Google Workspace (panduan lengkap ada di dalam skrip saat instalasi)
 
 ## Instalasi
 
@@ -65,7 +65,9 @@ bimxyz
 
 ### 1. Konfigurasi Awal
 Saat pertama kali dijalankan, skrip akan meminta:
-- **Service Account JSON** dari Google Cloud Console (folder Google Drive tujuan backup harus dibagikan ke email service account tersebut)
+- **Metode autentikasi Google Drive**:
+  - **OAuth** (rekomendasi untuk Gmail pribadi) — jalankan `rclone authorize "drive"` di perangkat lain yang punya browser, login dengan akun Google tujuan, lalu tempel JSON token yang dihasilkan
+  - **Service Account** — hanya untuk folder yang berada di **Shared Drive** (butuh Google Workspace); Service Account tidak memiliki kuota penyimpanan sendiri di Drive biasa sehingga akan gagal upload (`storageQuotaExceeded`) jika dipaksakan ke folder Gmail biasa
 - **Nama node** server (contoh: `SG-Node-01`) — dipakai sebagai penanda pada nama file backup
 
 ### 2. Menu Utama
@@ -77,7 +79,7 @@ Saat pertama kali dijalankan, skrip akan meminta:
 | 3. Atur Jadwal Backup Otomatis | Jadwalkan via cron — interval per jam atau per hari |
 | 4. Atur / Ubah Nama Node Server | Ubah label node yang dipakai di nama file backup |
 | 5. Lihat Status Sistem | Dashboard kondisi Drive, disk, swap, Wings, dan cron |
-| 6. Reset Autentikasi Google Drive | Hapus konfigurasi rclone & Service Account, setup ulang |
+| 6. Reset Autentikasi Google Drive | Hapus konfigurasi rclone (OAuth/Service Account), setup ulang |
 | 7. Manajemen Swap & Kernel | Tambah/ubah/hapus swap, optimasi parameter kernel |
 | 8. Keluar | Menutup panel |
 
@@ -116,7 +118,7 @@ Uninstaller akan menghentikan proses yang berjalan, menghapus konfigurasi, jadwa
 | Path | Keterangan |
 |---|---|
 | `/usr/local/bin/bimxyz` | Skrip utama setelah terinstal |
-| `/root/.bimxyz/` | Konfigurasi (Service Account JSON, nama node) |
+| `/root/.bimxyz/` | Konfigurasi (token OAuth atau Service Account JSON, nama node) |
 | `/root/bimxyz_backup/` | Penyimpanan backup lokal (retensi 3 hari) |
 | `/var/log/bimxyz_backup.log` | Log seluruh proses backup/restore |
 | `/root/volumes_snapshot_*` | Snapshot data lama sebelum proses restore |
