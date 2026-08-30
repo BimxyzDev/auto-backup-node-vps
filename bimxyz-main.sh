@@ -64,7 +64,6 @@ run_limited() {
             -p MemoryMax="$LIMIT_MEM_MAX" \
             -p MemorySwapMax=0 \
             -p IOWeight=10 \
-            -p OOMPolicy=continue \
             -- "$@"
         return $?
     fi
@@ -255,7 +254,13 @@ ensure_gdrive_folder() {
 # ─── KONEKSI GOOGLE DRIVE ─────────────────────────────────────
 gdrive_is_alive() {
     rclone listremotes 2>/dev/null | grep -q "^${REMOTE_NAME}:$" || return 1
-    rclone lsd "$REMOTE_NAME:" &>/dev/null || return 1
+    local err
+    err=$(rclone lsd "$REMOTE_NAME:" 2>&1 >/dev/null)
+    if [ -n "$err" ]; then
+        log ERROR "Detail error rclone: $err"
+        return 1
+    fi
+    return 0
 }
 
 setup_gdrive() {
@@ -403,8 +408,13 @@ _backup_worker() {
 
     log STEP "Menyalin data ke staging (rsync, snapshot konsisten tanpa menghentikan Wings)..."
     mkdir -p "$staging/volumes"
-    run_limited rsync -a --delete "$PTERO_PATH/" "$staging/volumes/" 2>/dev/null \
-        || { log ERROR "Gagal menyalin data ke staging."; rm -rf "$staging"; exit 1; }
+    local rsync_err
+    rsync_err=$(run_limited rsync -a --delete "$PTERO_PATH/" "$staging/volumes/" 2>&1 >/dev/null)
+    if [ $? -ne 0 ]; then
+        log ERROR "Gagal menyalin data ke staging. Detail: $rsync_err"
+        rm -rf "$staging"
+        exit 1
+    fi
     log INFO "Staging selesai."
 
     local t0=$SECONDS
