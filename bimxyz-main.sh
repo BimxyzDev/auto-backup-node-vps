@@ -17,8 +17,8 @@ readonly LOG_FILE="/var/log/bimxyz_backup.log"
 readonly SCRIPT_PATH="$(readlink -f "$0")"
 readonly MAX_RETRIES=3
 readonly RETENTION_DAYS=3
-readonly LIMIT_CPU_QUOTA="50%"
-readonly LIMIT_MEM_MAX="300M"
+readonly LIMIT_CPU_QUOTA="150%"
+readonly LIMIT_MEM_MAX="1536M"
 
 # ─── WARNA ────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'
@@ -39,9 +39,19 @@ log() {
 }
 
 # ─── PEMBERSIHAN ──────────────────────────────────────────────
+# PENTING: $TEMP_DIR dipakai bersama oleh semua proses (menu interaktif,
+# backup worker, restore worker) yang mungkin berjalan bersamaan. Trap EXIT
+# ini TIDAK BOLEH menghapus seluruh $TEMP_DIR — itu akan menghapus file milik
+# proses lain yang masih berjalan di background. Cukup bersihkan sisa file
+# milik PID proses ini sendiri saja.
+# ─── PEMBERSIHAN ──────────────────────────────────────────────
+# PENTING: $TEMP_DIR dipakai bersama oleh semua proses (menu interaktif,
+# backup worker, restore worker) yang mungkin berjalan bersamaan. Trap EXIT
+# global ini TIDAK menghapus $TEMP_DIR atau isinya — itu akan menghapus file
+# milik proses lain yang masih berjalan di background. Setiap worker
+# bertanggung jawab menghapus file temporernya sendiri (nama unik per waktu).
 cleanup() {
     local code=$?
-    [ -d "$TEMP_DIR" ] && rm -rf "$TEMP_DIR"
     [ $code -ne 0 ] && log ERROR "Proses dihentikan (kode keluar: $code) — periksa log: $LOG_FILE"
 }
 trap cleanup EXIT
@@ -63,7 +73,7 @@ run_limited() {
             -p CPUQuota="$LIMIT_CPU_QUOTA" \
             -p MemoryMax="$LIMIT_MEM_MAX" \
             -p MemorySwapMax=0 \
-            -p IOWeight=10 \
+            -p IOWeight=50 \
             -- "$@"
         return $?
     fi
@@ -354,6 +364,7 @@ rclone_retry() {
             --progress \
             --transfers=1 \
             --checkers=2 \
+            --multi-thread-streams=4 \
             --retries=5 \
             --low-level-retries=10 \
             --stats=30s \
@@ -371,14 +382,16 @@ smart_compress() {
     local src_dir="$1" src_name="$2" dest="$3"
     local tar_err tar_rc
 
-    # CPU sudah dibatasi oleh cgroup (run_limited), jadi cukup 1 thread pigz
-    # agar tidak ada overhead context-switch sia-sia di dalam jatah CPU yang kecil.
+    # CPU dibatasi oleh cgroup (run_limited) di level total, jadi menambah
+    # thread pigz tetap aman — totalnya tidak akan melebihi $LIMIT_CPU_QUOTA
+    # walau pigz jalan multi-thread. Dengan jatah 1.5 vCPU, 2 thread
+    # memanfaatkan alokasi ini lebih baik untuk dataset besar (200-800GB).
     # --ignore-failed-read + exit code 1 ditoleransi: karena dibaca langsung dari
     # folder live (Wings tetap berjalan), file sesi kecil (mis. pre-key WhatsApp)
     # wajar berubah/terhapus saat sedang dibaca. Itu bukan kegagalan backup.
     if command -v pigz &>/dev/null; then
         log STEP "Kompresi menggunakan pigz (dibatasi ${LIMIT_CPU_QUOTA} CPU / ${LIMIT_MEM_MAX} RAM)..."
-        tar_err=$(run_limited tar --use-compress-program="pigz -p 1" \
+        tar_err=$(run_limited tar --use-compress-program="pigz -p 2" \
             --ignore-failed-read --warning=no-file-changed --warning=no-file-removed \
             -f "$dest" --checkpoint=500 --checkpoint-action=dot \
             -c -C "$src_dir" "$src_name" 2>&1 >/dev/null)
@@ -413,6 +426,15 @@ _backup_worker() {
 
     log STEP "=== BACKUP WORKER DIMULAI (PID: $$) ==="
     log STEP "Node: $node | Nama file: $fname"
+
+    # Trap EXIT khusus untuk worker ini: bersihkan HANYA file miliknya sendiri
+    # (tidak menyentuh file worker lain yang mungkin berjalan bersamaan), sambil
+    # tetap mencatat kode keluar seperti trap global.
+    trap '
+        __code=$?
+        [ -f "$tmpf" ] && rm -f "$tmpf"
+        [ $__code -ne 0 ] && log ERROR "Proses dihentikan (kode keluar: $__code) — periksa log: $LOG_FILE"
+    ' EXIT
 
     [ -d "$PTERO_PATH" ] || { log ERROR "Direktori tidak ditemukan: $PTERO_PATH"; exit 1; }
 
@@ -501,6 +523,13 @@ _restore_worker() {
 
     mkdir -p "$TEMP_DIR"
     local local_file="$TEMP_DIR/$rfile"
+
+    # Trap EXIT khusus untuk worker ini: bersihkan HANYA file miliknya sendiri.
+    trap '
+        __code=$?
+        [ -f "$local_file" ] && rm -f "$local_file"
+        [ $__code -ne 0 ] && log ERROR "Proses dihentikan (kode keluar: $__code) — periksa log: $LOG_FILE"
+    ' EXIT
 
     log STEP "Mengunduh file: $rfile dari $remote"
     rclone_retry copy --include "$rfile" "$remote" "$TEMP_DIR/" \

@@ -18,7 +18,7 @@
 
 **Auto Backup Node Pterodactyl** adalah skrip Bash untuk melakukan backup otomatis seluruh isi `/var/lib/pterodactyl/volumes` di sebuah node Pterodactyl ke Google Drive, lengkap dengan fitur restore, penjadwalan (cron), dan manajemen resource server. Dibuat untuk kebutuhan operasional **Bimxyz Official** dalam menjaga data server pelanggan tetap aman tanpa mengganggu performa node yang sedang melayani banyak server sekaligus.
 
-Skrip ini dirancang agar **ringan** — proses backup dibatasi maksimum **0.5 vCPU dan 300MB RAM** memakai cgroup (`systemd-run`), sehingga node tetap responsif untuk melayani server-server yang sedang berjalan di atasnya, meskipun proses backup/restore/kompresi sedang aktif di background.
+Skrip ini dirancang agar **ringan** — proses backup dibatasi maksimum **1.5 vCPU dan 1.5GB RAM** memakai cgroup (`systemd-run`), sehingga node tetap responsif untuk melayani server-server yang sedang berjalan di atasnya, meskipun proses backup/restore/kompresi sedang aktif di background.
 
 ## Fitur
 
@@ -124,7 +124,7 @@ Uninstaller akan menghentikan proses yang berjalan, menghapus konfigurasi, jadwa
 ## FAQ
 
 **Apakah proses backup akan mengganggu server yang sedang online di node?**
-Tidak. Wings tetap berjalan penuh selama backup (data dikompres langsung dari folder live, tanpa menyalin ke staging terlebih dahulu — sehingga tidak butuh ruang disk ekstra), dan seluruh proses kompresi serta upload dibatasi maksimum 0.5 vCPU dan 300MB RAM plus prioritas I/O disk terendah menggunakan cgroup — sehingga server-server Pterodactyl lain di node yang sama tetap mendapat jatah resource yang cukup.
+Tidak. Wings tetap berjalan penuh selama backup (data dikompres langsung dari folder live, tanpa menyalin ke staging terlebih dahulu — sehingga tidak butuh ruang disk ekstra), dan seluruh proses kompresi serta upload dibatasi maksimum 1.5 vCPU dan 1.5GB RAM plus prioritas I/O disk terendah menggunakan cgroup — sehingga server-server Pterodactyl lain di node yang sama tetap mendapat jatah resource yang cukup.
 
 **Apakah Wings perlu dimatikan manual sebelum backup?**
 Tidak. Saat **backup**, Wings tetap berjalan penuh — skrip mengompres data langsung dari folder live (tanpa staging, sehingga hemat disk) dengan toleransi terhadap file sesi yang wajar berubah selama proses berlangsung. Saat **restore**, Wings dihentikan sementara secara otomatis (karena folder volume ditimpa langsung) dan dijalankan kembali setelah selesai.
